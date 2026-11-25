@@ -25,6 +25,27 @@ TEST_DATABASE_URL=postgres://santa:santa-local-only@127.0.0.1:5432/santa npm tes
 
 ## Game API
 
+### Traffic monitor
+
+`/app-monitor` uses the normal email-code sign-in. `GET /api/monitor/stats`
+requires a valid account session whose verified email is
+`mitchell.leefers@gmail.com`; the API enforces this, not just the page. Sign out
+to switch accounts. Existing sessions remain valid according to the account
+session policy below. The API response is not cached.
+
+`POST /api/monitor/visit` records a page load and sets a random, HttpOnly,
+SameSite=Lax browser cookie (Secure in production, renewed for one year).
+Only its SHA-256 hash and first/last seen times are stored, indefinitely, for
+unique-browser estimates. Clearing the cookie, using another browser, blocked
+cookies or automated traffic can inflate counts; blocked requests can reduce
+them. These are not counts of individual people. Visits to the monitor itself
+are excluded. The route has per-IP limits and rejects cross-site requests.
+Visitor and party-creation totals start when the migration is deployed: earlier
+visits and parties already deleted cannot be recovered. Active party and player
+counts include only retained parties (including players added by others); they
+decrease as players are removed or parties expire. A database trigger counts
+successful new parties even after their records are deleted.
+
 All routes are under `/api`, return `Cache-Control: no-store`, and use JSON
 errors `{ "error": "message" }`. Players authenticate with
 `Authorization: Bearer <token>`; the token is returned once on create/join and

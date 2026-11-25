@@ -114,6 +114,38 @@ async function allowPhotos(call, code, token, as) {
   assert.equal(result.status, 200);
 }
 
+test('monitor requires the admin session and counts visits and retained parties', { skip }, async (t) => {
+  const { call, signIn } = await serve(t);
+  assert.equal((await call('GET', '/api/monitor/stats')).status, 401);
+  const other = await signIn();
+  assert.equal((await call('GET', '/api/monitor/stats', { cookie: other.cookie })).status, 403);
+  const adminUser = await signIn('mitchell.leefers@gmail.com');
+  const before = (await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie })).body;
+
+  const visit = await call('POST', '/api/monitor/visit');
+  assert.equal(visit.status, 204);
+  const visitorCookie = visit.headers.getSetCookie().find((value) => value.startsWith('santa-visitor='));
+  assert.match(visitorCookie, /HttpOnly/i);
+  assert.match(visitorCookie, /SameSite=Lax/i);
+  assert.equal((await call('POST', '/api/monitor/visit', { cookie: visitorCookie.split(';')[0] })).status, 204);
+  assert.equal((await call('POST', '/api/monitor/visit', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+  const created = await call('POST', '/api/parties', { cookie: adminUser.cookie, json: { name: 'Host' } });
+  assert.equal(created.status, 201);
+  assert.equal((await call('POST', `/api/parties/${created.body.code}/players`, { json: { name: 'Guest' } })).status, 201);
+
+  const stats = await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie });
+  assert.equal(stats.headers.get('cache-control'), 'no-store');
+  assert.equal(Number(stats.body.browsers), Number(before.browsers) + 1);
+  assert.equal(Number(stats.body.page_loads), Number(before.page_loads) + 2);
+  assert.equal(Number(stats.body.parties_created), Number(before.parties_created) + 1);
+  assert.equal(Number(stats.body.active_parties), Number(before.active_parties) + 1);
+  assert.equal(Number(stats.body.active_players), Number(before.active_players) + 2);
+  await pool.query('DELETE FROM parties WHERE code = $1', [created.body.code]);
+  const after = (await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie })).body;
+  assert.equal(Number(after.parties_created), Number(stats.body.parties_created));
+  assert.equal(Number(after.active_players), Number(before.active_players));
+});
+
 test('email accounts restore hosted parties across visits and API instances without local tokens', { skip }, async (t) => {
   const { call, signIn } = await serve(t);
   assert.equal((await call('POST', '/api/parties', { json: { name: 'Host' } })).status, 401);

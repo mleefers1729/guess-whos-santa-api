@@ -10,6 +10,7 @@ import sharp from 'sharp';
 import { readConfig } from './config.js';
 import { createGameRouter } from './game.js';
 import { createAccountAuth } from './accounts.js';
+import { createMonitorRouter } from './monitor.js';
 
 const imageTypes = new Map([
   ['image/jpeg', 'jpeg'],
@@ -91,6 +92,9 @@ export async function createApp(config = readConfig(), { checkDatabase, reposito
       repository, secureCookies: config.secureCookies, rateLimitEnabled: config.rateLimitEnabled, sendLoginCode,
     });
     app.use('/api', accounts.middleware, accounts.router);
+    app.use('/api', createMonitorRouter({
+      repository, secureCookies: config.secureCookies, rateLimitEnabled: config.rateLimitEnabled,
+    }));
     app.use('/api', createGameRouter({
       repository, storage, maxUploadBytes: config.maxUploadBytes, rateLimitEnabled: config.rateLimitEnabled,
     }));

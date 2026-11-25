@@ -196,7 +196,7 @@ test('GitHub deployment trusts only the intended repository on main and separate
 test('SPA routes work without rewriting API, media, or missing assets into HTML', () => {
   const source = readFileSync(new URL('../edge/spa.js', import.meta.url), 'utf8');
   const rewrite = (uri) => runInNewContext(`${source}; handler(event)`, { event: { request: { uri } } });
-  for (const uri of ['/', '/j/ABCDE', '/party/ABCDE', '/party/ABCDE/']) {
+  for (const uri of ['/', '/j/ABCDE', '/party/ABCDE', '/party/ABCDE/', '/app-monitor', '/app-monitor/']) {
     assert.equal(rewrite(uri).uri, '/index.html');
   }
   for (const uri of ['/assets/missing.js', '/favicon.svg', '/assets/missing']) {

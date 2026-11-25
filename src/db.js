@@ -66,6 +66,27 @@ CREATE TABLE IF NOT EXISTS guesses (
   PRIMARY KEY (guesser_id, photo_id)
 );
 CREATE INDEX IF NOT EXISTS guesses_photo_idx ON guesses (photo_id);
+CREATE TABLE IF NOT EXISTS monitor_totals (
+  id boolean PRIMARY KEY DEFAULT true CHECK (id),
+  started_at timestamptz NOT NULL DEFAULT now(),
+  parties_created bigint NOT NULL DEFAULT 0,
+  page_loads bigint NOT NULL DEFAULT 0
+);
+INSERT INTO monitor_totals (id) VALUES (true) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS monitor_visitors (
+  token_hash bytea PRIMARY KEY,
+  first_seen timestamptz NOT NULL DEFAULT now(),
+  last_seen timestamptz NOT NULL DEFAULT now()
+);
+CREATE OR REPLACE FUNCTION monitor_party_created() RETURNS trigger AS $$
+BEGIN
+  UPDATE monitor_totals SET parties_created = parties_created + 1 WHERE id = true;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS monitor_party_created_trigger ON parties;
+CREATE TRIGGER monitor_party_created_trigger AFTER INSERT ON parties
+  FOR EACH ROW EXECUTE FUNCTION monitor_party_created();
 `;
 
 export async function migrate(pool) {
@@ -97,6 +118,30 @@ export async function transaction(pool, work) {
 export function createRepository(pool, { retentionDays = 30 } = {}) {
   return {
     ...createAccountRepository(pool, retentionDays),
+    async recordVisit(tokenHash) {
+      await transaction(pool, async (client) => {
+        await client.query(`
+          INSERT INTO monitor_visitors (token_hash) VALUES ($1)
+          ON CONFLICT (token_hash) DO UPDATE SET last_seen = now()`, [tokenHash]);
+        await client.query('UPDATE monitor_totals SET page_loads = page_loads + 1 WHERE id = true');
+      });
+    },
+
+    async monitorStats() {
+      const { rows } = await pool.query(`
+        SELECT m.started_at, m.parties_created, m.page_loads,
+          (SELECT count(*) FROM monitor_visitors) AS browsers,
+          (SELECT count(*) FROM monitor_visitors WHERE last_seen >= now() - interval '7 days') AS browsers_7d,
+          (SELECT count(*) FROM parties WHERE created_at > now() - make_interval(days => $1)) AS active_parties,
+          (SELECT count(*) FROM players pl JOIN parties pa ON pa.id = pl.party_id
+            WHERE pa.created_at > now() - make_interval(days => $1)) AS active_players,
+          (SELECT count(*) FROM parties WHERE phase = 'lobby' AND created_at > now() - make_interval(days => $1)) AS lobby,
+          (SELECT count(*) FROM parties WHERE phase = 'guessing' AND created_at > now() - make_interval(days => $1)) AS guessing,
+          (SELECT count(*) FROM parties WHERE phase = 'reveal' AND created_at > now() - make_interval(days => $1)) AS reveal
+        FROM monitor_totals m WHERE m.id = true`, [retentionDays]);
+      return rows[0];
+    },
+
     async createParty({ partyId, code, name, host }) {
       return transaction(pool, async (client) => {
         await client.query('INSERT INTO parties (id, code, name) VALUES ($1, $2, $3)', [partyId, code, name]);
