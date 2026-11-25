@@ -100,10 +100,14 @@ before hashing and are never logged or returned by the API.
 | `POST /parties/:code/added-players` `{name}` | members | Lobby only; adds a phone-less player managed by the caller |
 | `DELETE /parties/:code/players/:id` | host, or the player's adder | Lobby only; deletes their photos and any players they added |
 | `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos |
-| `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing yourself or your added players |
-| `POST /parties/:code/reveal` | host | Guessing → reveal |
+| `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing your own photo or after your reveal |
+| `POST /parties/:code/reveal` | members | Reveals and locks guesses for this player; party enters reveal phase after all players reveal |
 
-Photo, media-consent and guess routes accept `?as=<playerId>` to act for a player you added.
+Photo, media-consent, guess and reveal routes accept `?as=<playerId>` to act for a player you added.
+Game state includes a stable, separately shuffled `views` entry for the member
+and each player they manage. Each view exposes faces and scores only after that
+player reveals. Scores are provisional until everyone has revealed. Existing
+parties already in the reveal phase remain revealed after migration.
 
 ### Photo privacy model
 
@@ -121,9 +125,10 @@ Photo, media-consent and guess routes accept `?as=<playerId>` to act for a playe
   - **face**: the full photo (≤ 1024 px) for the reveal.
 - Object keys are random UUIDs (`media/<party>/<photo>.webp`,
   `reveals/<party>/<photo>.webp`); names never appear in keys or URLs.
-- Before reveal, state contains no face URLs and no Santa→player mapping (a
-  player only learns which Santa is their own). Face URLs are issued only in the
-  reveal phase, only to authenticated members of that party.
+- Before a player's reveal, their view contains no face URLs or Santa→player
+  mapping (they only learn which Santa is their own). Face URLs are issued only
+  to authenticated members for their own revealed view or a revealed player
+  they manage. A shared device can access all of its managed players' views.
 - Photo URLs are signed per object and expire in 10–15 minutes: CloudFront
   signed URLs in production; HMAC-signed `/api/local-media/...` URLs locally.
 - Parties are inaccessible after 30 days and deleted hourly (cascading to

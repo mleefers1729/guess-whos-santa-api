@@ -68,16 +68,16 @@ function isUniqueViolation(error) {
   return error?.code === '23505';
 }
 
-// Deterministic per-party order that does not reveal join order or player ids.
-function santaOrder(photos) {
-  return [...photos].sort((a, b) => a.id.localeCompare(b.id));
+// Stable for each player across polls and reveal, without exposing join order.
+function santaOrder(photos, playerId) {
+  const key = (photo) => createHash('sha256').update(`${playerId}:${photo.id}`).digest('hex');
+  return [...photos].sort((a, b) => key(a).localeCompare(key(b)));
 }
 
 export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
   const expiresAt = new Date(Math.floor(now / URL_BUCKET_MS) * URL_BUCKET_MS + URL_TTL_MS);
   const rolls = Math.floor(now / URL_BUCKET_MS);
   const photoOwner = new Map(snapshot.photos.map((photo) => [photo.id, photo.player_id]));
-  const santas = santaOrder(snapshot.photos);
   // "Crew" = me plus the players I added; this device uploads and guesses for all of them.
   const crew = new Set([me.id, ...snapshot.players.filter((p) => p.added_by === me.id).map((p) => p.id)]);
   const players = snapshot.players.map((player) => {
@@ -89,6 +89,7 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
       addedBy: player.added_by,
       hasPhoto: Boolean(photo),
       guessCount: snapshot.guesses.filter((guess) => guess.guesser_id === player.id).length,
+      revealed: Boolean(player.revealed_at),
       ...(crew.has(player.id) && {
         eyesUrl: photo ? storage.url(photo.eyes_key, expiresAt) : null,
         mediaConsent: player.media_consent,
@@ -105,44 +106,32 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
     players,
     myEyesUrl: myPhoto ? storage.url(myPhoto.eyes_key, expiresAt) : null,
   };
-  if (party.phase === 'guessing') {
-    const mine = new Map(snapshot.guesses.filter((g) => g.guesser_id === me.id)
-      .map((g) => [g.photo_id, g.guessed_player_id]));
-    state.santas = santas.map((photo, index) => ({
-      id: photo.id,
-      number: index + 1,
-      eyesUrl: storage.url(photo.eyes_key, expiresAt),
-      isMine: photo.player_id === me.id,
-      myGuess: mine.get(photo.id) ?? null,
-      ownerId: crew.has(photo.player_id) ? photo.player_id : null,
-      guesses: Object.fromEntries(snapshot.guesses
-        .filter((g) => g.photo_id === photo.id && crew.has(g.guesser_id))
-        .map((g) => [g.guesser_id, g.guessed_player_id])),
-    }));
-  }
-  if (party.phase === 'reveal') {
+  if (party.phase !== 'lobby') {
     const scores = new Map(snapshot.players.map((player) => [player.id, 0]));
     for (const guess of snapshot.guesses) {
       if (photoOwner.get(guess.photo_id) === guess.guessed_player_id) {
         scores.set(guess.guesser_id, scores.get(guess.guesser_id) + 1);
       }
     }
-    state.santas = santas.map((photo, index) => {
-      const guesses = snapshot.guesses.filter((guess) => guess.photo_id === photo.id);
-      return {
-        id: photo.id,
-        number: index + 1,
-        eyesUrl: storage.url(photo.eyes_key, expiresAt),
-        faceUrl: storage.url(photo.face_key, expiresAt),
-        playerId: photo.player_id,
-        myGuess: guesses.find((guess) => guess.guesser_id === me.id)?.guessed_player_id ?? null,
-        correctCount: guesses.filter((guess) => guess.guessed_player_id === photo.player_id).length,
-        guessCount: guesses.length,
-      };
-    });
-    state.leaderboard = players
+    const leaderboard = players
       .map((player) => ({ playerId: player.id, name: player.name, score: scores.get(player.id) }))
       .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+    state.views = Object.fromEntries(snapshot.players.filter((player) => crew.has(player.id)).map((player) => {
+      const revealed = Boolean(player.revealed_at);
+      const santas = santaOrder(snapshot.photos, player.id).map((photo, index) => {
+        const guesses = snapshot.guesses.filter((guess) => guess.photo_id === photo.id);
+        const myGuess = guesses.find((guess) => guess.guesser_id === player.id)?.guessed_player_id ?? null;
+        const common = { id: photo.id, number: index + 1, eyesUrl: storage.url(photo.eyes_key, expiresAt), myGuess };
+        return revealed ? {
+          ...common, faceUrl: storage.url(photo.face_key, expiresAt), playerId: photo.player_id,
+          correctCount: guesses.filter((guess) => guess.guessed_player_id === photo.player_id).length,
+          guessCount: guesses.length,
+        } : { ...common, isMine: photo.player_id === player.id };
+      });
+      return [player.id, { revealed, santas, ...(revealed && { leaderboard }) }];
+    }));
+    state.santas = state.views[me.id].santas;
+    if (state.views[me.id].revealed) state.leaderboard = leaderboard;
   }
   return { state, etag: `W/"${party.version}-${me.id}-${rolls}"` };
 }
@@ -355,7 +344,6 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
       closed: [409, 'Guessing is not open'],
       'missing-photo': [404, 'Santa not found'],
       'own-photo': [400, "That's you! Guess the other Santas"],
-      'crew-photo': [400, 'You added that Santa! Guess the others'],
       'invalid-suspect': [400, 'Pick someone else in this party'],
       duplicate: [409, 'You already guessed this Santa'],
     };
@@ -363,9 +351,9 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     await sendState(req, res);
   });
 
-  router.post('/parties/:code/reveal', authenticate, hostOnly, async (req, res) => {
-    const result = await repository.advance({ partyId: req.me.party_id, from: 'guessing', to: 'reveal' });
-    if (result !== 'advanced') throw httpError(409, 'Reveal is only available during guessing');
+  router.post('/parties/:code/reveal', authenticate, actor, async (req, res) => {
+    const result = await repository.revealPlayer({ partyId: req.me.party_id, playerId: req.actor.id });
+    if (result !== 'revealed') throw httpError(409, 'Reveal is only available once per player during guessing');
     await sendState(req, res);
   });
 

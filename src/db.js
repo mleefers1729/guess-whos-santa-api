@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS players (
 ALTER TABLE players ADD COLUMN IF NOT EXISTS added_by uuid REFERENCES players (id) ON DELETE CASCADE;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS media_consent jsonb NOT NULL DEFAULT '{}';
 ALTER TABLE players ADD COLUMN IF NOT EXISTS account_id uuid REFERENCES accounts (id);
+ALTER TABLE players ADD COLUMN IF NOT EXISTS revealed_at timestamptz;
+UPDATE players SET revealed_at = now() FROM parties
+  WHERE players.party_id = parties.id AND parties.phase = 'reveal' AND players.revealed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS players_party_account_idx ON players (party_id, account_id) WHERE account_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS players_added_by_idx ON players (added_by);
 CREATE UNIQUE INDEX IF NOT EXISTS players_party_name_idx ON players (party_id, lower(name));
@@ -188,7 +191,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async snapshot(partyId) {
       const [players, photos, guesses] = await Promise.all([
-        pool.query('SELECT id, name, is_host, added_by, media_consent FROM players WHERE party_id = $1 ORDER BY created_at, id', [partyId]),
+        pool.query('SELECT id, name, is_host, added_by, media_consent, revealed_at FROM players WHERE party_id = $1 ORDER BY created_at, id', [partyId]),
         pool.query('SELECT id, player_id, eyes_key, face_key FROM photos WHERE party_id = $1 ORDER BY id', [partyId]),
         pool.query(`
           SELECT g.guesser_id, g.photo_id, g.guessed_player_id
@@ -278,14 +281,13 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       return transaction(pool, async (client) => {
         const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR SHARE', [partyId]);
         if (rows[0]?.phase !== 'guessing') return 'closed';
-        // A crew is a member plus the players they added; nobody guesses their own crew's Santas.
+        const guesser = await client.query('SELECT revealed_at FROM players WHERE id = $1 AND party_id = $2', [guesserId, partyId]);
+        if (!guesser.rows[0] || guesser.rows[0].revealed_at) return 'closed';
         const photo = await client.query(`
-          SELECT pl.id, coalesce(pl.added_by, pl.id) AS crew FROM photos ph JOIN players pl ON pl.id = ph.player_id
+          SELECT pl.id FROM photos ph JOIN players pl ON pl.id = ph.player_id
           WHERE ph.id = $1 AND ph.party_id = $2`, [photoId, partyId]);
         if (!photo.rows[0]) return 'missing-photo';
         if (photo.rows[0].id === guesserId) return 'own-photo';
-        const guesser = await client.query('SELECT coalesce(added_by, id) AS crew FROM players WHERE id = $1', [guesserId]);
-        if (guesser.rows[0]?.crew === photo.rows[0].crew) return 'crew-photo';
         const suspect = await client.query(`
           SELECT 1 FROM players pl JOIN photos ph ON ph.player_id = pl.id
           WHERE pl.id = $1 AND pl.party_id = $2 AND pl.id <> $3`, [guessedPlayerId, partyId, guesserId]);
@@ -296,6 +298,24 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
         if (!inserted.rowCount) return 'duplicate';
         await client.query('UPDATE parties SET version = version + 1 WHERE id = $1', [partyId]);
         return 'saved';
+      });
+    },
+
+    async revealPlayer({ partyId, playerId }) {
+      return transaction(pool, async (client) => {
+        const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
+        if (rows[0]?.phase !== 'guessing') return 'closed';
+        const updated = await client.query(`
+          UPDATE players SET revealed_at = now()
+          WHERE id = $1 AND party_id = $2 AND revealed_at IS NULL`, [playerId, partyId]);
+        if (!updated.rowCount) return 'closed';
+        await client.query(`
+          UPDATE parties SET version = version + 1,
+            phase = CASE WHEN NOT EXISTS (
+              SELECT 1 FROM players WHERE party_id = $1 AND revealed_at IS NULL
+            ) THEN 'reveal' ELSE phase END
+          WHERE id = $1`, [partyId]);
+        return 'revealed';
       });
     },
 

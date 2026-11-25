@@ -10,6 +10,7 @@ import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { readConfig } from '../src/config.js';
 import { createRepository, migrate } from '../src/db.js';
+import { buildState } from '../src/game.js';
 import { createLocalStorage, createS3Storage, processPhoto } from '../src/photos.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -113,6 +114,28 @@ async function allowPhotos(call, code, token, as) {
   });
   assert.equal(result.status, 200);
 }
+
+test('each managed player gets a stable shuffled order and their own reveal', () => {
+  const players = Array.from({ length: 10 }, (_, i) => ({
+    id: `player-${i}`, name: `Player ${i}`, is_host: i === 0,
+    added_by: i === 1 ? 'player-0' : null, revealed_at: i === 1 ? new Date() : null,
+  }));
+  const photos = players.map((player, i) => ({
+    id: `photo-${i}`, player_id: player.id, eyes_key: `eyes/${i}`, face_key: `faces/${i}`,
+  }));
+  const args = {
+    me: players[0], party: { code: 'ABCDEF', phase: 'guessing', version: 1 },
+    snapshot: { players, photos, guesses: [] }, storage: { url: (key) => key }, now: 0,
+  };
+  const state = buildState(args).state;
+  const mine = state.views['player-0'];
+  const added = state.views['player-1'];
+  assert.notDeepEqual(mine.santas.map((santa) => santa.id), added.santas.map((santa) => santa.id));
+  assert.deepEqual(mine.santas.map((santa) => santa.id), buildState(args).state.views['player-0'].santas.map((santa) => santa.id));
+  assert.equal(mine.santas.filter((santa) => santa.isMine).length, 1);
+  assert.ok(mine.santas.every((santa) => !santa.faceUrl && !santa.playerId));
+  assert.ok(added.santas.every((santa) => santa.faceUrl && santa.playerId));
+});
 
 test('monitor requires the admin session and counts visits and retained parties', { skip }, async (t) => {
   const { call, signIn } = await serve(t);
@@ -389,8 +412,7 @@ test('a full party: masked eyes before reveal, real faces only for members after
   const serialized = JSON.stringify(guessing);
   assert.ok(!serialized.includes('reveals/'), 'no face URLs before reveal');
   for (const santa of guessing.santas) {
-    assert.deepEqual(Object.keys(santa).sort(), ['eyesUrl', 'guesses', 'id', 'isMine', 'myGuess', 'number', 'ownerId']);
-    assert.ok(santa.ownerId === null || santa.isMine, 'owners of other Santas stay hidden');
+    assert.deepEqual(Object.keys(santa).sort(), ['eyesUrl', 'id', 'isMine', 'myGuess', 'number']);
   }
   const eyes = await fetch(base + guessing.santas[0].eyesUrl);
   assert.equal(eyes.status, 200);
@@ -419,13 +441,26 @@ test('a full party: masked eyes before reveal, real faces only for members after
     token: ava.token, json: { playerId: ben.playerId },
   });
 
-  assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: ben.token })).status, 403);
   const revealed = await call('POST', `/api/parties/${code}/reveal`, { token: host.token });
-  assert.equal(revealed.body.phase, 'reveal');
+  assert.equal(revealed.body.phase, 'guessing');
+  assert.equal(revealed.body.views[host.playerId].revealed, true);
   const outsider = (await createHost({ name: 'Stranger' })).body;
   assert.equal((await call('GET', `/api/parties/${code}`, { token: outsider.token })).status, 401);
 
-  const reveal = (await call('GET', `/api/parties/${code}`, { token: ben.token })).body;
+  const benBeforeReveal = (await call('GET', `/api/parties/${code}`, { token: ben.token })).body;
+  assert.equal(benBeforeReveal.views[ben.playerId].revealed, false);
+  assert.ok(!JSON.stringify(benBeforeReveal).includes('reveals/'));
+  const benTarget = benBeforeReveal.santas.find((santa) => !santa.isMine);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${benTarget.id}`, {
+    token: ben.token, json: { playerId: host.playerId },
+  })).status, 200, 'another player can still guess after a reveal');
+  const reveal = (await call('POST', `/api/parties/${code}/reveal`, { token: ben.token })).body;
+  assert.equal(reveal.phase, 'guessing');
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${others[0].id}`, {
+    token: ben.token, json: { playerId: host.playerId },
+  })).status, 409);
+  assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: ben.token })).status, 409);
+  assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: ava.token })).body.phase, 'reveal');
   const avaSanta = reveal.santas.find((santa) => santa.playerId === ava.playerId);
   const face = await fetch(base + avaSanta.faceUrl);
   assert.equal(face.status, 200);
@@ -541,34 +576,39 @@ test('members add players without phones and play for them', { skip }, async (t)
   assert.equal(timPhoto.body.me.hasPhoto, false, 'photo belongs to Tim, not Ava');
   assert.ok(timPhoto.body.players.find((p) => p.id === tim.id).eyesUrl);
   assert.equal((await upload(host.token, null, await photo('blue'))).status, 201);
+  assert.equal((await upload(ava.token, null, await photo('red'))).status, 201);
   assert.equal((await upload(ben.token, ben2.id, await photo('pink'))).status, 201);
   assert.equal((await call('POST', `/api/parties/${code}/start`, { token: host.token })).status, 200);
 
   const state = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
-  const timSanta = state.santas.find((santa) => santa.ownerId === tim.id);
-  assert.ok(timSanta && !timSanta.isMine);
-  assert.equal(state.santas.filter((santa) => santa.ownerId).length, 1, 'only my crew owners are visible');
-  const other = state.santas.find((santa) => !santa.ownerId);
+  const timSanta = state.views[tim.id].santas.find((santa) => santa.isMine);
+  assert.ok(timSanta);
+  const other = state.views[tim.id].santas.find((santa) => !santa.isMine);
   assert.equal((await call('PUT', `/api/parties/${code}/guesses/${timSanta.id}`, {
     token: ava.token, json: { playerId: tim.id },
-  })).status, 400, "Ava can't score on the Santa she uploaded");
+  })).status, 200, 'Ava can guess the Santa she uploaded');
   assert.equal((await call('PUT', `/api/parties/${code}/guesses/${timSanta.id}?as=${tim.id}`, {
     token: ava.token, json: { playerId: host.playerId },
   })).status, 400, 'Tim cannot guess his own Santa');
-  const guessed = await call('PUT', `/api/parties/${code}/guesses/${other.id}?as=${tim.id}`, {
-    token: ava.token, json: { playerId: host.playerId },
+  const avaSanta = state.santas.find((santa) => santa.isMine);
+  const guessed = await call('PUT', `/api/parties/${code}/guesses/${avaSanta.id}?as=${tim.id}`, {
+    token: ava.token, json: { playerId: ava.playerId },
   });
-  assert.equal(guessed.status, 200);
-  const card = guessed.body.santas.find((santa) => santa.id === other.id);
-  assert.deepEqual([card.guesses[tim.id], card.myGuess], [host.playerId, null], "Tim's guess is separate from Ava's");
+  assert.equal(guessed.status, 200, 'a managed player can guess their adder');
+  const card = guessed.body.views[tim.id].santas.find((santa) => santa.id === avaSanta.id);
+  assert.equal(card.myGuess, ava.playerId);
   assert.equal(guessed.body.players.find((p) => p.id === tim.id).guessCount, 1);
   assert.equal((await call('PUT', `/api/parties/${code}/guesses/${other.id}?as=${tim.id}`, {
     token: ben.token, json: { playerId: host.playerId },
   })).status, 404);
 
-  const revealed = (await call('POST', `/api/parties/${code}/reveal`, { token: host.token })).body;
-  assert.ok(revealed.leaderboard.some((row) => row.playerId === tim.id));
-  assert.equal(revealed.santas.find((santa) => santa.playerId === tim.id).faceUrl.includes('reveals/'), true);
+  assert.equal((await call('POST', `/api/parties/${code}/reveal?as=${tim.id}`, { token: ben.token })).status, 404);
+  const revealed = (await call('POST', `/api/parties/${code}/reveal?as=${tim.id}`, { token: ava.token })).body;
+  assert.equal(revealed.views[tim.id].revealed, true);
+  assert.equal(revealed.views[ava.playerId].revealed, false);
+  assert.ok(revealed.views[tim.id].leaderboard.some((row) => row.playerId === tim.id));
+  assert.ok(revealed.views[tim.id].santas.find((santa) => santa.playerId === tim.id).faceUrl.includes('reveals/'));
+  assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: ava.token })).body.views[ava.playerId].revealed, true);
 });
 
 test('added players are removed by their adder or the host, and leave with their adder', { skip }, async (t) => {
