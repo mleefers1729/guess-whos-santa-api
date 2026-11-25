@@ -89,7 +89,10 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
       addedBy: player.added_by,
       hasPhoto: Boolean(photo),
       guessCount: snapshot.guesses.filter((guess) => guess.guesser_id === player.id).length,
-      ...(crew.has(player.id) && { eyesUrl: photo ? storage.url(photo.eyes_key, expiresAt) : null }),
+      ...(crew.has(player.id) && {
+        eyesUrl: photo ? storage.url(photo.eyes_key, expiresAt) : null,
+        mediaConsent: player.media_consent,
+      }),
     };
   });
   const myPhoto = snapshot.photos.find((photo) => photo.player_id === me.id);
@@ -152,7 +155,7 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
   }) : (_req, _res, next) => next());
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: maxUploadBytes, files: 1, fields: 3, parts: 4 },
+    limits: { fileSize: maxUploadBytes, files: 1, fields: 5, parts: 6 },
     fileFilter: (_req, file, done) => done(imageTypes.has(file.mimetype)
       ? null : httpError(415, 'Only JPEG, PNG, and WebP images are supported'), imageTypes.has(file.mimetype)),
   });
@@ -261,9 +264,29 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     await sendState(req, res, 201);
   });
 
+  router.put('/parties/:code/media-consent', limiter(60), authenticate, actor, async (req, res) => {
+    const { kind, granted } = req.body ?? {};
+    if (!['camera', 'photos'].includes(kind) || typeof granted !== 'boolean') {
+      throw httpError(400, 'Send a camera or photos consent choice with a boolean granted value');
+    }
+    const result = await repository.saveMediaConsent({
+      partyId: req.me.party_id, playerId: req.actor.id, kind, granted, recordedBy: req.me.id,
+    });
+    if (result === 'closed') throw httpError(409, 'Photo access choices are locked once guessing starts');
+    if (result === 'missing') throw httpError(404, 'Player not found');
+    await sendState(req, res);
+  });
+
   router.put('/parties/:code/photo', limiter(30), authenticate, actor, upload.single('photo'), async (req, res) => {
     if (!req.file) throw httpError(400, 'A photo file is required');
     if (req.me.phase !== 'lobby') throw httpError(409, 'Photos are locked once guessing starts');
+    const { source, shareConsent } = req.body ?? {};
+    if (!['camera', 'photos'].includes(source) || shareConsent !== 'true') {
+      throw httpError(400, 'Photo source and explicit party-sharing consent are required');
+    }
+    if (!req.actor.media_consent[source]?.granted) {
+      throw httpError(403, 'Allow this photo source before uploading');
+    }
     let processed;
     try {
       processed = await processPhoto(req.file.buffer, req.file.mimetype, parseAlignment(req.body ?? {}));
@@ -274,9 +297,12 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     const photo = { id: randomUUID() };
     Object.assign(photo, photoKeys(req.me.party_id, photo.id));
     await Promise.all([storage.put(photo.eyesKey, processed.eyes), storage.put(photo.faceKey, processed.face)]);
-    const result = await repository.savePhoto({ partyId: req.me.party_id, playerId: req.actor.id, photo });
-    if (result.status === 'closed') {
+    const result = await repository.savePhoto({
+      partyId: req.me.party_id, playerId: req.actor.id, photo, source, recordedBy: req.me.id,
+    });
+    if (result.status !== 'saved') {
       await storage.remove([photo.eyesKey, photo.faceKey]);
+      if (result.status === 'consent-required') throw httpError(403, 'Allow this photo source before uploading');
       throw httpError(409, 'Photos are locked once guessing starts');
     }
     if (result.replaced) {

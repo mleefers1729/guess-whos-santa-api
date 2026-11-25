@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS players (
 );
 -- Players added by another member (kids, anyone without a phone); that member acts for them.
 ALTER TABLE players ADD COLUMN IF NOT EXISTS added_by uuid REFERENCES players (id) ON DELETE CASCADE;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS media_consent jsonb NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS players_added_by_idx ON players (added_by);
 CREATE UNIQUE INDEX IF NOT EXISTS players_party_name_idx ON players (party_id, lower(name));
 CREATE TABLE IF NOT EXISTS photos (
@@ -81,7 +82,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async findPlayer(code, tokenHash) {
       const { rows } = await pool.query(`
-        SELECT pl.id, pl.name, pl.is_host, pa.id AS party_id, pa.code, pa.phase, pa.version
+        SELECT pl.id, pl.name, pl.is_host, pl.media_consent, pa.id AS party_id, pa.code, pa.phase, pa.version
         FROM players pl JOIN parties pa ON pa.id = pl.party_id
         WHERE pa.code = $1 AND pl.token_hash = $2
           AND pa.created_at > now() - make_interval(days => $3)`, [code, tokenHash, retentionDays]);
@@ -115,7 +116,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async snapshot(partyId) {
       const [players, photos, guesses] = await Promise.all([
-        pool.query('SELECT id, name, is_host, added_by FROM players WHERE party_id = $1 ORDER BY created_at, id', [partyId]),
+        pool.query('SELECT id, name, is_host, added_by, media_consent FROM players WHERE party_id = $1 ORDER BY created_at, id', [partyId]),
         pool.query('SELECT id, player_id, eyes_key, face_key FROM photos WHERE party_id = $1 ORDER BY id', [partyId]),
         pool.query(`
           SELECT g.guesser_id, g.photo_id, g.guessed_player_id
@@ -127,7 +128,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async findAddedPlayer({ partyId, addedBy, playerId }) {
       const { rows } = await pool.query(
-        'SELECT id, name, is_host FROM players WHERE id = $1 AND party_id = $2 AND added_by = $3',
+        'SELECT id, name, is_host, media_consent FROM players WHERE id = $1 AND party_id = $2 AND added_by = $3',
         [playerId, partyId, addedBy]);
       return rows[0];
     },
@@ -137,9 +138,24 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       return rows[0]?.phase === 'lobby';
     },
 
-    async savePhoto({ partyId, playerId, photo }) {
+    async saveMediaConsent({ partyId, playerId, kind, granted, recordedBy }) {
+      return transaction(pool, async (client) => {
+        if (!(await this.lockLobby(client, partyId))) return 'closed';
+        const { rowCount } = await client.query(`
+          UPDATE players SET media_consent = media_consent || jsonb_build_object($2::text,
+            jsonb_build_object('granted', $3::boolean, 'recordedAt', now(), 'recordedBy', $4::text, 'version', 1))
+          WHERE id = $1 AND party_id = $5`, [playerId, kind, granted, recordedBy, partyId]);
+        if (!rowCount) return 'missing';
+        await bump(client, partyId);
+        return 'saved';
+      });
+    },
+
+    async savePhoto({ partyId, playerId, photo, source, recordedBy }) {
       return transaction(pool, async (client) => {
         if (!(await this.lockLobby(client, partyId))) return { status: 'closed' };
+        const consent = await client.query('SELECT media_consent FROM players WHERE id = $1 AND party_id = $2', [playerId, partyId]);
+        if (!consent.rows[0]?.media_consent[source]?.granted) return { status: 'consent-required' };
         const { rows } = await client.query(
           'SELECT eyes_key, face_key FROM photos WHERE player_id = $1', [playerId]);
         await client.query(`
@@ -147,6 +163,10 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
           ON CONFLICT (player_id) DO UPDATE SET id = EXCLUDED.id, eyes_key = EXCLUDED.eyes_key,
             face_key = EXCLUDED.face_key, created_at = now()`,
         [photo.id, partyId, playerId, photo.eyesKey, photo.faceKey]);
+        await client.query(`
+          UPDATE players SET media_consent = media_consent || jsonb_build_object('sharing',
+            jsonb_build_object('granted', true, 'recordedAt', now(), 'recordedBy', $2::text, 'version', 1))
+          WHERE id = $1`, [playerId, recordedBy]);
         await bump(client, partyId);
         return { status: 'saved', replaced: rows[0] };
       });

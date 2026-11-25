@@ -37,17 +37,25 @@ only its SHA-256 hash is stored.
 | `PATCH /parties/:code` `{name}` | host | Renames the party (1-40 characters) |
 | `POST /parties/:code/players` `{name}` | anyone with the code | Lobby only; names unique per party (case-insensitive) |
 | `GET /parties/:code` | members | Party state; supports `If-None-Match` (304) for 3 s polling |
-| `PUT /parties/:code/photo` | members | Multipart `photo` + `x`, `y`, `zoom`; lobby only; replaces previous photo |
+| `PUT /parties/:code/media-consent` `{kind, granted}` | members | Lobby only; `kind` is `camera` or `photos`, `granted` is a boolean |
+| `PUT /parties/:code/photo` | members | Multipart `photo` + `x`, `y`, `zoom`, `source` (`camera` or `photos`), `shareConsent` (`true`); requires saved source consent; lobby only; replaces previous photo |
 | `POST /parties/:code/added-players` `{name}` | members | Lobby only; adds a phone-less player managed by the caller |
 | `DELETE /parties/:code/players/:id` | host, or the player's adder | Lobby only; deletes their photos and any players they added |
 | `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos |
 | `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing yourself or your added players |
 | `POST /parties/:code/reveal` | host | Guessing → reveal |
 
-Photo and guess routes accept `?as=<playerId>` to act for a player you added.
+Photo, media-consent and guess routes accept `?as=<playerId>` to act for a player you added.
 
 ### Photo privacy model
 
+- Each player's `media_consent` stores the latest camera/photo-picker consent
+  decisions, server timestamps, acting member ID and notice version (1).
+  These are app consent records, not claims about browser/OS permission.
+  Successful uploads atomically record party-sharing consent with the photo.
+  State exposes `mediaConsent` only for the caller and players they added;
+  records expire with their player/party. Consent is required for new uploads,
+  including replacement photos for players created before this migration.
 - On upload the server validates the image (JPEG/PNG/WebP, ≤ 10 MiB, ≤ 20 MP,
   single frame), auto-orients it and produces two metadata-stripped WebP files:
   - **eyes**: only the pixels inside the Santa eye window (420×96), computed from

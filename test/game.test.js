@@ -69,7 +69,7 @@ const photo = (background) => sharp({
 
 function photoForm(buffer, fields = {}) {
   const form = new FormData();
-  for (const [key, value] of Object.entries(fields)) form.append(key, String(value));
+  for (const [key, value] of Object.entries({ source: 'photos', shareConsent: true, ...fields })) form.append(key, String(value));
   form.append('photo', new Blob([buffer], { type: 'image/jpeg' }), 'me.jpg');
   return form;
 }
@@ -78,8 +78,70 @@ async function party(call) {
   const host = (await call('POST', '/api/parties', { json: { name: 'Mom' } })).body;
   const ava = (await call('POST', `/api/parties/${host.code}/players`, { json: { name: 'Ava' } })).body;
   const ben = (await call('POST', `/api/parties/${host.code.toLowerCase()}/players`, { json: { name: 'Ben' } })).body;
+  for (const player of [host, ava, ben]) await allowPhotos(call, host.code, player.token);
   return { code: host.code, host, ava, ben };
 }
+
+async function allowPhotos(call, code, token, as) {
+  const result = await call('PUT', `/api/parties/${code}/media-consent${as ? `?as=${as}` : ''}`, {
+    token, json: { kind: 'photos', granted: true },
+  });
+  assert.equal(result.status, 200);
+}
+
+test('media consent is explicit, persisted per player, private to their crew, and required for uploads', { skip }, async (t) => {
+  const { call, directory } = await serve(t);
+  const host = (await call('POST', '/api/parties', { json: { name: 'Host' } })).body;
+  const code = host.code;
+  const guest = (await call('POST', `/api/parties/${code}/players`, { json: { name: 'Guest' } })).body;
+  const path = `/api/parties/${code}/media-consent`;
+  const upload = (fields = {}) => call('PUT', `/api/parties/${code}/photo`, {
+    token: host.token, body: photoForm(image, fields),
+  });
+  const image = await photo('green');
+  const initial = await call('GET', `/api/parties/${code}`, { token: host.token });
+  assert.deepEqual(initial.body.players.find((p) => p.id === host.playerId).mediaConsent, {});
+  assert.equal((await upload()).status, 403);
+  assert.equal((await call('PUT', path, { json: { kind: 'photos', granted: true } })).status, 401);
+  for (const json of [{ kind: 'photos', granted: 'true' }, { kind: 'sharing', granted: true }, {}]) {
+    assert.equal((await call('PUT', path, { token: host.token, json })).status, 400);
+  }
+  const allowed = await call('PUT', path, { token: host.token, json: { kind: 'camera', granted: true } });
+  assert.equal(allowed.status, 200);
+  assert.equal((await call('GET', `/api/parties/${code}`, {
+    token: host.token, headers: { 'If-None-Match': initial.headers.get('etag') },
+  })).status, 200, 'consent changes invalidate polling state');
+  const saved = (await call('GET', `/api/parties/${code}`, { token: host.token })).body.players
+    .find((p) => p.id === host.playerId).mediaConsent.camera;
+  assert.equal(saved.granted, true);
+  assert.equal(saved.recordedBy, host.playerId);
+  assert.equal(saved.version, 1);
+  assert.ok(Number.isFinite(Date.parse(saved.recordedAt)));
+  assert.equal((await upload({ source: 'camera', shareConsent: false })).status, 400);
+  assert.equal((await upload({ source: 'camera', shareConsent: '' })).status, 400);
+  assert.equal((await upload({ source: 'photos' })).status, 403, 'camera consent is not library consent');
+  assert.equal((await readdir(directory, { recursive: true })).length, 0, 'unconsented photos never reach storage');
+  const uploaded = await upload({ source: 'camera' });
+  assert.equal(uploaded.status, 201);
+  assert.equal(uploaded.body.players.find((p) => p.id === host.playerId).mediaConsent.sharing.granted, true);
+  await call('PUT', path, { token: host.token, json: { kind: 'camera', granted: false } });
+  assert.equal((await upload({ source: 'camera' })).status, 403, 'declining updates a previous grant');
+  const stored = await pool.query('SELECT media_consent FROM players WHERE id = $1', [host.playerId]);
+  assert.equal(stored.rows[0].media_consent.camera.granted, false);
+  const outsiderView = (await call('GET', `/api/parties/${code}`, { token: guest.token })).body;
+  assert.equal(Object.hasOwn(outsiderView.players.find((p) => p.id === host.playerId), 'mediaConsent'), false);
+
+  const added = (await call('POST', `/api/parties/${code}/added-players`, {
+    token: host.token, json: { name: 'Child' },
+  })).body.players.find((p) => p.name === 'Child');
+  assert.equal((await call('PUT', `${path}?as=${added.id}`, {
+    token: guest.token, json: { kind: 'photos', granted: true },
+  })).status, 404);
+  await allowPhotos(call, code, host.token, added.id);
+  const crew = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.equal(crew.players.find((p) => p.id === added.id).mediaConsent.photos.recordedBy, host.playerId);
+  assert.equal(crew.players.find((p) => p.id === host.playerId).mediaConsent.photos, undefined);
+});
 
 test('a full party: masked eyes before reveal, real faces only for members after reveal', { skip }, async (t) => {
   const { base, call, directory } = await serve(t);
@@ -105,6 +167,9 @@ test('a full party: masked eyes before reveal, real faces only for members after
   assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: host.token })).status, 409);
   const started = await call('POST', `/api/parties/${code}/start`, { token: host.token });
   assert.equal(started.body.phase, 'guessing');
+  assert.equal((await call('PUT', `/api/parties/${code}/media-consent`, {
+    token: host.token, json: { kind: 'camera', granted: true },
+  })).status, 409);
   assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'Late' } })).status, 409);
   assert.equal((await call('PUT', `/api/parties/${code}/photo`, {
     token: ava.token, body: photoForm(await photo('pink')),
@@ -254,6 +319,8 @@ test('members add players without phones and play for them', { skip }, async (t)
   assert.equal((await call('POST', `/api/parties/${code}/added-players`, { token: ben.token, json: { name: 'tiny tim' } })).status, 409);
   const ben2 = (await call('POST', `/api/parties/${code}/added-players`, { token: ben.token, json: { name: 'Baby Bo' } })).body
     .players.find((p) => p.name === 'Baby Bo');
+  await allowPhotos(call, code, ava.token, tim.id);
+  await allowPhotos(call, code, ben.token, ben2.id);
 
   const upload = (token, as, color) => call('PUT', `/api/parties/${code}/photo${as ? `?as=${as}` : ''}`, {
     token, body: photoForm(color),
@@ -302,6 +369,7 @@ test('added players are removed by their adder or the host, and leave with their
   const tim = await add(ava.token, 'Tim');
   const sue = await add(ava.token, 'Sue');
   const bo = await add(ben.token, 'Bo');
+  await allowPhotos(call, code, ava.token, sue.id);
   assert.equal((await call('PUT', `/api/parties/${code}/photo?as=${sue.id}`, { token: ava.token, body: photoForm(await photo('red')) })).status, 201);
 
   assert.equal((await call('DELETE', `/api/parties/${code}/players/${bo.id}`, { token: ava.token })).status, 403);
@@ -331,8 +399,10 @@ test('hosts name and rename parties; invitees preview the name', { skip }, async
   assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.name, 'Work Holiday Party');
   assert.equal((await call('POST', '/api/parties', { json: { name: 'Mom', partyName: '<b>' } })).status, 400);
 
+  await allowPhotos(call, named.code, named.token);
   await call('PUT', `/api/parties/${named.code}/photo`, { token: named.token, body: photoForm(await photo('red')) });
   const guest = (await call('POST', `/api/parties/${named.code}/players`, { json: { name: 'Ava' } })).body;
+  await allowPhotos(call, named.code, guest.token);
   await call('PUT', `/api/parties/${named.code}/photo`, { token: guest.token, body: photoForm(await photo('blue')) });
   assert.equal((await call('POST', `/api/parties/${named.code}/start`, { token: named.token })).status, 200);
   assert.deepEqual((await call('GET', `/api/parties/${named.code}/invite`)).body, { code: named.code, name: null, open: false });
