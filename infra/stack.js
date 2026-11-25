@@ -365,16 +365,16 @@ export class SantaStack extends Stack {
       url: 'https://token.actions.githubusercontent.com',
       clientIdList: ['sts.amazonaws.com'],
     });
-    const deploymentRole = (id, repository) => new iam.Role(this, id, {
+    const deploymentRole = (id, repository, repositoryId) => new iam.Role(this, id, {
       assumedBy: new iam.WebIdentityPrincipal(github.ref, {
         StringEquals: {
           'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-          'token.actions.githubusercontent.com:sub': `repo:mleefers1729/${repository}:ref:refs/heads/main`,
+          'token.actions.githubusercontent.com:sub': `repo:mleefers1729@55854922/${repository}@${repositoryId}:ref:refs/heads/main`,
         },
       }),
       maxSessionDuration: Duration.hours(1),
     });
-    const frontendDeploy = deploymentRole('GitHubFrontendDeploy', 'guess-whos-santa');
+    const frontendDeploy = deploymentRole('GitHubFrontendDeploy', 'guess-whos-santa', '1471782918');
     webBucket.grantRead(frontendDeploy);
     frontendDeploy.addToPolicy(new iam.PolicyStatement({
       actions: ['s3:PutObject'], resources: [webBucket.arnForObjects('*')],
@@ -383,7 +383,7 @@ export class SantaStack extends Stack {
       actions: ['cloudfront:CreateInvalidation', 'cloudfront:GetInvalidation'],
       resources: [`arn:${this.partition}:cloudfront::${this.account}:distribution/${distribution.distributionId}`],
     }));
-    const apiDeploy = deploymentRole('GitHubApiDeploy', 'guess-whos-santa-api');
+    const apiDeploy = deploymentRole('GitHubApiDeploy', 'guess-whos-santa-api', '1471785145');
     for (const role of [frontendDeploy, apiDeploy]) {
       role.addToPolicy(new iam.PolicyStatement({
         actions: ['ses:GetAccount'], resources: ['*'],

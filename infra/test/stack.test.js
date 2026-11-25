@@ -171,7 +171,7 @@ test('GitHub deployment trusts only the intended repository on main and separate
     const identityRead = statements.find((statement) => statement.Action === 'ses:GetEmailIdentity');
     assert.ok(JSON.stringify(identityRead.Resource).includes('SignInEmail'));
     assert.ok(!statements.some((statement) => [statement.Action].flat().includes('ses:SendEmail')));
-    if (subject.includes('guess-whos-santa:ref:')) {
+    if (subject === 'repo:mleefers1729@55854922/guess-whos-santa@1471782918:ref:refs/heads/main') {
       const s3 = statements.filter((statement) => [statement.Action].flat().some((action) => action.startsWith('s3:')));
       assert.ok(s3.some((statement) => [statement.Action].flat().includes('s3:PutObject')));
       assert.ok(s3.every((statement) => JSON.stringify(statement.Resource).includes('WebBucket')));
@@ -188,8 +188,8 @@ test('GitHub deployment trusts only the intended repository on main and separate
     }
   }
   assert.deepEqual(subjects, new Set([
-    'repo:mleefers1729/guess-whos-santa:ref:refs/heads/main',
-    'repo:mleefers1729/guess-whos-santa-api:ref:refs/heads/main',
+    'repo:mleefers1729@55854922/guess-whos-santa@1471782918:ref:refs/heads/main',
+    'repo:mleefers1729@55854922/guess-whos-santa-api@1471785145:ref:refs/heads/main',
   ]));
 });
 

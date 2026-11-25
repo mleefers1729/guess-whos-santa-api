@@ -192,7 +192,9 @@ short-lived GitHub OIDC credentials, not AWS keys stored in GitHub.
 
 The stack provisions a GitHub OIDC provider and two deployment roles. Each
 trust policy restricts the audience to `sts.amazonaws.com` and the subject to
-one exact repository's `refs/heads/main`. Protect `main` in both repositories:
+one exact repository's immutable owner and repository IDs and `refs/heads/main`.
+If either repository is recreated or renamed, update the corresponding trust policy.
+Protect `main` in both repositories:
 anyone who can change and push its workflows can use that repository's role.
 The frontend role can read/write only the web bucket, invalidate this
 distribution, and check SES readiness. It cannot access player photos.
