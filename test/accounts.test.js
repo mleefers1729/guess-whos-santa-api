@@ -14,10 +14,22 @@ test('SendGrid sends the browser-bound code using the authenticated sender', asy
   assert.ok(options.signal instanceof AbortSignal);
   const body = JSON.parse(options.body);
   assert.deepEqual(body.personalizations, [{ to: [{ email: 'recipient@example.com' }] }]);
-  assert.deepEqual(body.from, { email: 'signin@guesswhossanta.com', name: "Guess Who's Santa" });
-  assert.equal(body.content[0].type, 'text/plain');
-  assert.match(body.content[0].value, /001234/);
-  assert.match(body.content[0].value, /10 minutes.*browser/);
+  assert.deepEqual(body.from, { email: 'signin@guesswhossanta.com', name: "Santa's Helpers | Guess Who's Santa" });
+  assert.match(body.subject, /Santa's helpers.*sign-in code/);
+  assert.doesNotMatch(body.subject, /001234/);
+  assert.deepEqual(body.content.map((part) => part.type), ['text/plain', 'text/html']);
+  for (const { value } of body.content) {
+    assert.match(value, /Santa's helpers/);
+    assert.match(value, /001234/);
+    assert.match(value, /10 minutes/);
+    assert.match(value, /only in that browser/);
+    assert.match(value, /Never share/);
+    assert.match(value, /If you did not request it/);
+  }
+  const html = body.content[1].value;
+  assert.match(html, /<img src="https:\/\/guesswhossanta\.com\/icon-512\.png"[^>]+alt="[^"]+"/);
+  assert.match(html, /<p[^>]*>001234<\/p>/);
+  assert.doesNotMatch(html, /<script|<form|<svg|data:image/i);
 });
 
 test('SendGrid failures propagate without exposing provider responses or credentials', async (t) => {

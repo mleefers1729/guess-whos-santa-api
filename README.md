@@ -59,6 +59,9 @@ name) and `SENDGRID_API_KEY` with Mail Send permission. ECS injects the key from
 Secrets Manager; it is never stored in source or logged. Missing delivery
 configuration returns an explicit `503`; there is no log-code or development
 authentication bypass. Tests inject a fake mailer and do not send real email.
+Sign-in emails include a Santa-themed HTML layout using the site's public Santa
+icon, plus a plain-text alternative. The code and safety instructions remain
+readable even when an email client blocks images.
 
 | Route | Notes |
 | --- | --- |
@@ -168,7 +171,7 @@ Photo, media-consent and guess routes accept `?as=<playerId>` to act for a playe
 | `MEDIA_KEY_PAIR_ID` / `MEDIA_PRIVATE_KEY` | unset | CloudFront public key ID and private PEM for signed URLs; required in production |
 | `LOCAL_MEDIA_DIR` / `LOCAL_MEDIA_SECRET` | `./media` / random | Local photo storage and URL-signing secret when S3 is not configured |
 | `PHOTO_RETENTION_DAYS` | `30` | Party/photo lifetime |
-| `AUTH_EMAIL_FROM` | unset | SendGrid-authenticated email address; required in production. Infrastructure sets `signin@guesswhossanta.com`; emails display as Guess Who's Santa |
+| `AUTH_EMAIL_FROM` | unset | SendGrid-authenticated email address; required in production. Infrastructure sets `signin@guesswhossanta.com`; emails display as Santa's Helpers \| Guess Who's Santa |
 | `SENDGRID_API_KEY` | unset | SendGrid key with Mail Send permission; required in production, injected from Secrets Manager in ECS |
 | `AWS_REGION` | `us-east-1` | S3 region |
 | `RATE_LIMIT` | on | Set `off` only for tests |
