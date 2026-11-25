@@ -1,0 +1,259 @@
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
+import express from 'express';
+import { rateLimit } from 'express-rate-limit';
+import multer from 'multer';
+import { ImageError, parseAlignment, photoKeys, processPhoto } from './photos.js';
+
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const CODE_LENGTH = 6;
+// Signed photo URLs live 10-15 minutes; the ETag rolls every 5 minutes so polling clients refresh them.
+const URL_TTL_MS = 15 * 60 * 1000;
+const URL_BUCKET_MS = 5 * 60 * 1000;
+const MIN_SANTAS = 2;
+const imageTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+const hashToken = (token) => createHash('sha256').update(token).digest();
+
+function newCode() {
+  return Array.from({ length: CODE_LENGTH }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join('');
+}
+
+function newPlayer(name, isHost = false) {
+  const token = randomBytes(32).toString('base64url');
+  return { id: randomUUID(), name, isHost, token, tokenHash: hashToken(token) };
+}
+
+function readName(body) {
+  const name = typeof body?.name === 'string' ? body.name.normalize('NFC').replace(/\s+/g, ' ').trim() : '';
+  if (name.length < 1 || name.length > 30 || /[\p{Cc}<>]/u.test(name)) {
+    throw httpError(400, 'Name must be 1-30 characters');
+  }
+  return name;
+}
+
+function readCode(value) {
+  const code = String(value ?? '').toUpperCase();
+  if (code.length !== CODE_LENGTH || [...code].some((c) => !CODE_ALPHABET.includes(c))) {
+    throw httpError(404, 'Party not found');
+  }
+  return code;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function readId(value, message) {
+  if (typeof value !== 'string' || !UUID.test(value)) throw httpError(404, message);
+  return value.toLowerCase();
+}
+
+function isUniqueViolation(error) {
+  return error?.code === '23505';
+}
+
+// Deterministic per-party order that does not reveal join order or player ids.
+function santaOrder(photos) {
+  return [...photos].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
+  const expiresAt = new Date(Math.floor(now / URL_BUCKET_MS) * URL_BUCKET_MS + URL_TTL_MS);
+  const rolls = Math.floor(now / URL_BUCKET_MS);
+  const photoOwner = new Map(snapshot.photos.map((photo) => [photo.id, photo.player_id]));
+  const santas = santaOrder(snapshot.photos);
+  const players = snapshot.players.map((player) => ({
+    id: player.id,
+    name: player.name,
+    isHost: player.is_host,
+    hasPhoto: snapshot.photos.some((photo) => photo.player_id === player.id),
+    guessCount: snapshot.guesses.filter((guess) => guess.guesser_id === player.id).length,
+  }));
+  const myPhoto = snapshot.photos.find((photo) => photo.player_id === me.id);
+  const state = {
+    code: party.code,
+    phase: party.phase,
+    version: party.version,
+    me: { id: me.id, name: me.name, isHost: me.is_host, hasPhoto: Boolean(myPhoto) },
+    players,
+    myEyesUrl: myPhoto ? storage.url(myPhoto.eyes_key, expiresAt) : null,
+  };
+  if (party.phase === 'guessing') {
+    const mine = new Map(snapshot.guesses.filter((g) => g.guesser_id === me.id)
+      .map((g) => [g.photo_id, g.guessed_player_id]));
+    state.santas = santas.map((photo, index) => ({
+      id: photo.id,
+      number: index + 1,
+      eyesUrl: storage.url(photo.eyes_key, expiresAt),
+      isMine: photo.player_id === me.id,
+      myGuess: mine.get(photo.id) ?? null,
+    }));
+  }
+  if (party.phase === 'reveal') {
+    const scores = new Map(snapshot.players.map((player) => [player.id, 0]));
+    for (const guess of snapshot.guesses) {
+      if (photoOwner.get(guess.photo_id) === guess.guessed_player_id) {
+        scores.set(guess.guesser_id, scores.get(guess.guesser_id) + 1);
+      }
+    }
+    state.santas = santas.map((photo, index) => {
+      const guesses = snapshot.guesses.filter((guess) => guess.photo_id === photo.id);
+      return {
+        id: photo.id,
+        number: index + 1,
+        eyesUrl: storage.url(photo.eyes_key, expiresAt),
+        faceUrl: storage.url(photo.face_key, expiresAt),
+        playerId: photo.player_id,
+        myGuess: guesses.find((guess) => guess.guesser_id === me.id)?.guessed_player_id ?? null,
+        correctCount: guesses.filter((guess) => guess.guessed_player_id === photo.player_id).length,
+        guessCount: guesses.length,
+      };
+    });
+    state.leaderboard = players
+      .map((player) => ({ playerId: player.id, name: player.name, score: scores.get(player.id) }))
+      .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  }
+  return { state, etag: `W/"${party.version}-${me.id}-${rolls}"` };
+}
+
+export function createGameRouter({ repository, storage, maxUploadBytes, rateLimitEnabled = true }) {
+  const router = express.Router();
+  const limiter = (limit, windowMs = 15 * 60 * 1000) => (rateLimitEnabled ? rateLimit({
+    windowMs, limit, standardHeaders: 'draft-8', legacyHeaders: false,
+    message: { error: 'Too many requests; try again later' },
+  }) : (_req, _res, next) => next());
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: maxUploadBytes, files: 1, fields: 3, parts: 4 },
+    fileFilter: (_req, file, done) => done(imageTypes.has(file.mimetype)
+      ? null : httpError(415, 'Only JPEG, PNG, and WebP images are supported'), imageTypes.has(file.mimetype)),
+  });
+
+  router.use((_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+
+  async function authenticate(req, _res, next) {
+    const code = readCode(req.params.code);
+    const token = /^Bearer ([\w-]{20,100})$/.exec(req.get('authorization') ?? '')?.[1];
+    const me = token && await repository.findPlayer(code, hashToken(token));
+    if (!me) throw httpError(401, 'Join this party to continue');
+    req.me = me;
+    next();
+  }
+
+  function hostOnly(req, _res, next) {
+    if (!req.me.is_host) throw httpError(403, 'Only the host can do that');
+    next();
+  }
+
+  async function sendState(req, res, status = 200) {
+    const party = await repository.findParty(req.me.code);
+    const snapshot = await repository.snapshot(req.me.party_id);
+    const { state, etag } = buildState({ me: req.me, party, snapshot, storage });
+    res.set('ETag', etag);
+    // Compared manually: fetch() adds Cache-Control: no-cache to conditional requests, which defeats req.fresh.
+    const known = (req.get('if-none-match') ?? '').split(',').map((tag) => tag.trim());
+    if (status === 200 && req.method === 'GET' && known.includes(etag)) return res.status(304).end();
+    res.status(status).json(state);
+  }
+
+  router.post('/parties', limiter(20), async (req, res) => {
+    const host = newPlayer(readName(req.body), true);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const code = newCode();
+      try {
+        await repository.createParty({ partyId: randomUUID(), code, host });
+        return res.status(201).json({ code, playerId: host.id, token: host.token });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+      }
+    }
+    throw httpError(503, 'Could not create a party; try again');
+  });
+
+  router.post('/parties/:code/players', limiter(60), async (req, res) => {
+    const party = await repository.findParty(readCode(req.params.code));
+    if (!party) throw httpError(404, 'Party not found');
+    const player = newPlayer(readName(req.body));
+    let result;
+    try {
+      result = await repository.addPlayer({ partyId: party.id, player });
+    } catch (error) {
+      if (isUniqueViolation(error)) throw httpError(409, 'Someone at this party already has that name');
+      throw error;
+    }
+    if (result === 'closed') throw httpError(409, 'This party has already started');
+    res.status(201).json({ code: party.code, playerId: player.id, token: player.token });
+  });
+
+  router.get('/parties/:code', authenticate, (req, res) => sendState(req, res));
+
+  router.put('/parties/:code/photo', limiter(30), authenticate, upload.single('photo'), async (req, res) => {
+    if (!req.file) throw httpError(400, 'A photo file is required');
+    if (req.me.phase !== 'lobby') throw httpError(409, 'Photos are locked once guessing starts');
+    let processed;
+    try {
+      processed = await processPhoto(req.file.buffer, req.file.mimetype, parseAlignment(req.body ?? {}));
+    } catch (error) {
+      if (error instanceof ImageError) throw httpError(422, error.message);
+      throw error;
+    }
+    const photo = { id: randomUUID() };
+    Object.assign(photo, photoKeys(req.me.party_id, photo.id));
+    await Promise.all([storage.put(photo.eyesKey, processed.eyes), storage.put(photo.faceKey, processed.face)]);
+    const result = await repository.savePhoto({ partyId: req.me.party_id, playerId: req.me.id, photo });
+    if (result.status === 'closed') {
+      await storage.remove([photo.eyesKey, photo.faceKey]);
+      throw httpError(409, 'Photos are locked once guessing starts');
+    }
+    if (result.replaced) {
+      await storage.remove([result.replaced.eyes_key, result.replaced.face_key]).catch(console.error);
+    }
+    await sendState(req, res, 201);
+  });
+
+  router.delete('/parties/:code/players/:playerId', authenticate, hostOnly, async (req, res) => {
+    const result = await repository.removePlayer({ partyId: req.me.party_id, playerId: readId(req.params.playerId, 'Player not found') });
+    if (result.status === 'closed') throw httpError(409, 'Players can only be removed before guessing starts');
+    if (result.status === 'missing') throw httpError(404, 'Player not found');
+    if (result.status === 'host') throw httpError(400, 'The host cannot be removed');
+    if (result.photo) {
+      await storage.remove([result.photo.eyes_key, result.photo.face_key]).catch(console.error);
+    }
+    await sendState(req, res);
+  });
+
+  router.post('/parties/:code/start', authenticate, hostOnly, async (req, res) => {
+    const result = await repository.advance({
+      partyId: req.me.party_id, from: 'lobby', to: 'guessing', minimumPhotos: MIN_SANTAS,
+    });
+    if (result === 'not-enough-photos') throw httpError(409, `At least ${MIN_SANTAS} Santas need photos to start`);
+    if (result !== 'advanced') throw httpError(409, 'The game has already started');
+    await sendState(req, res);
+  });
+
+  router.put('/parties/:code/guesses/:photoId', authenticate, async (req, res) => {
+    const guessedPlayerId = readId(req.body?.playerId, 'Pick someone else in this party');
+    const result = await repository.addGuess({
+      partyId: req.me.party_id, guesserId: req.me.id,
+      photoId: readId(req.params.photoId, 'Santa not found'), guessedPlayerId,
+    });
+    const errors = {
+      closed: [409, 'Guessing is not open'],
+      'missing-photo': [404, 'Santa not found'],
+      'own-photo': [400, "That's you! Guess the other Santas"],
+      'invalid-suspect': [400, 'Pick someone else in this party'],
+      duplicate: [409, 'You already guessed this Santa'],
+    };
+    if (errors[result]) throw httpError(...errors[result]);
+    await sendState(req, res);
+  });
+
+  router.post('/parties/:code/reveal', authenticate, hostOnly, async (req, res) => {
+    const result = await repository.advance({ partyId: req.me.party_id, from: 'guessing', to: 'reveal' });
+    if (result !== 'advanced') throw httpError(409, 'Reveal is only available during guessing');
+    await sendState(req, res);
+  });
+
+  return router;
+}

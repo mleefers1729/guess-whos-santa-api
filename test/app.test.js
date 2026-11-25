@@ -18,6 +18,7 @@ before(async () => {
   const app = await createApp({
     ...readConfig({}),
     uploadDir,
+    enableLocalUploads: true,
     maxUploadBytes: 1024,
   });
   server = app.listen(0, '127.0.0.1');
@@ -41,7 +42,7 @@ function sendPhoto(data = photo, type = 'image/png', field = 'photo') {
 
 async function isolatedApp(t) {
   const directory = await mkdtemp(join(tmpdir(), 'santa-limits-'));
-  const app = await createApp({ ...readConfig({}), uploadDir: directory });
+  const app = await createApp({ ...readConfig({}), uploadDir: directory, enableLocalUploads: true });
   const instance = app.listen(0, '127.0.0.1');
   await once(instance, 'listening');
   t.after(async () => {
@@ -52,14 +53,14 @@ async function isolatedApp(t) {
 }
 
 test('health endpoint supports the configured React origin and security headers', async () => {
-  const response = await fetch(`${baseUrl}/health`, {
+  const response = await fetch(`${baseUrl}/api/health`, {
     headers: { Origin: 'http://localhost:5173' },
   });
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('access-control-allow-origin'), 'http://localhost:5173');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('x-powered-by'), null);
-  assert.deepEqual(await response.json(), { status: 'ok', name: 'guess-whos-santa-api' });
+  assert.deepEqual(await response.json(), { status: 'ok', database: 'not-configured' });
 });
 
 test('CORS does not grant access to another origin', async () => {

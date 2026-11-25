@@ -1,0 +1,9 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: santa
+      POSTGRES_PASSWORD: santa-local-only
+      POSTGRES_DB: santa
+    ports:
+      - "127.0.0.1:5432:5432"

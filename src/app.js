@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import cors from 'cors';
@@ -8,6 +8,7 @@ import helmet from 'helmet';
 import multer from 'multer';
 import sharp from 'sharp';
 import { readConfig } from './config.js';
+import { createGameRouter } from './game.js';
 
 const imageTypes = new Map([
   ['image/jpeg', 'jpeg'],
@@ -19,12 +20,17 @@ function requestError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
-export async function createApp(config = readConfig()) {
+export async function createApp(config = readConfig(), { checkDatabase, repository, storage } = {}) {
+  if (config.database && !checkDatabase) {
+    throw new Error('Database readiness check is required when a database is configured');
+  }
   const incomingDir = join(config.uploadDir, '.incoming');
-  await mkdir(config.uploadDir, { recursive: true, mode: 0o700 });
-  await mkdir(incomingDir, { recursive: true, mode: 0o700 });
+  if (config.enableLocalUploads) {
+    await mkdir(config.uploadDir, { recursive: true, mode: 0o700 });
+    await mkdir(incomingDir, { recursive: true, mode: 0o700 });
+  }
 
-  const upload = multer({
+  const upload = config.enableLocalUploads ? multer({
     storage: multer.diskStorage({
       destination: incomingDir,
       filename: (_req, _file, done) => done(null, randomUUID()),
@@ -36,19 +42,56 @@ export async function createApp(config = readConfig()) {
       }
       done(null, true);
     },
-  });
+  }) : undefined;
 
   const app = express();
   app.disable('x-powered-by');
+  app.set('trust proxy', config.trustProxy);
   app.use(helmet());
-  app.use(cors({ origin: config.clientOrigin }));
-  app.use(express.json({ limit: '32kb' }));
-
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', name: 'guess-whos-santa-api' });
   });
 
-  app.post('/api/uploads',
+  app.use((req, _res, next) => {
+    if (config.originVerifySecret) {
+      const expected = Buffer.from(config.originVerifySecret);
+      const actual = Buffer.from(req.get('x-origin-verify') ?? '');
+      if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+        return next(requestError(403, 'Direct API access is not allowed'));
+      }
+    }
+    next();
+  });
+  app.use(cors({ origin: config.clientOrigin }));
+  app.use(express.json({ limit: '32kb' }));
+
+  app.get('/api/health', async (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (checkDatabase) {
+      try {
+        await checkDatabase();
+      } catch (error) {
+        console.error('Database readiness check failed', error);
+        return res.status(503).json({ status: 'unavailable', database: 'unavailable' });
+      }
+    }
+    res.json({ status: 'ok', database: checkDatabase ? 'connected' : 'not-configured' });
+  });
+
+  if (storage?.read) {
+    app.get('/api/local-media/*key', async (req, res) => {
+      const body = await storage.read(req.params.key.join('/'), req.query);
+      if (!body) throw requestError(404, 'Media not found');
+      res.set({ 'Content-Type': 'image/webp', 'Cache-Control': 'private, no-store' }).send(body);
+    });
+  }
+  if (repository && storage) {
+    app.use('/api', createGameRouter({
+      repository, storage, maxUploadBytes: config.maxUploadBytes, rateLimitEnabled: config.rateLimitEnabled,
+    }));
+  }
+
+  if (config.enableLocalUploads) app.post('/api/uploads',
     rateLimit({
       windowMs: 15 * 60 * 1000,
       limit: 20,
@@ -105,7 +148,7 @@ export async function createApp(config = readConfig()) {
     let message = error.message;
     if (error instanceof multer.MulterError) {
       status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
-      message = status === 413 ? 'Photo exceeds the upload size limit' : 'Send exactly one file in the photo field and no other fields';
+      message = status === 413 ? 'Photo exceeds the upload size limit' : 'Send one photo file plus alignment fields only';
     } else if (error.type === 'entity.parse.failed') {
       message = 'Invalid JSON body';
     } else if (error.type === 'entity.too.large') {
