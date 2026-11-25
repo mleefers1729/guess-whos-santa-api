@@ -78,8 +78,9 @@ Non-read requests using account cookies and all `/auth/*` writes require
 `X-Santa-Request: 1`; cross-site Fetch Metadata is rejected. Use the same-origin
 `/api` proxy, not cross-origin cookies. Account session routes never cache.
 
-Hosts must sign in before creating a party. Anonymous guests still use the
-existing bearer flow and may optionally link their saved parties on sign-in.
+Hosts must sign in before creating a party. Anonymous guests provide an email
+for guessing notifications and use the existing bearer flow; they may
+optionally link their saved parties on sign-in.
 Signing in never grants access by party code or display name alone, never
 moves a player already bound to another account, and preserves managed players,
 photos and guesses. Once linked, a legacy token cannot bypass account sign-out.
@@ -93,13 +94,15 @@ before hashing and are never logged or returned by the API.
 | `POST /parties` `{name, partyName?}` | signed-in account | Creates a saved party and host; party name defaults to "<host>’s party" for members; returns `{code, name, playerId, account: true}` |
 | `GET /parties/:code/invite` | anyone with the code | `{code, name, open}` for the join screen; `name` is null unless the host set one and the lobby is open (never exposes the host's name) |
 | `PATCH /parties/:code` `{name}` | host | Renames the party (1-40 characters) |
-| `POST /parties/:code/players` `{name}` | anyone with the code | Lobby only; names unique per party (case-insensitive) |
+| `POST /parties/:code/players` `{name, email}` | anyone with the code | Lobby only; email required for guests, signed-in accounts use their email; names unique per party (case-insensitive) |
 | `GET /parties/:code` | members | Party state; supports `If-None-Match` (304) for 3 s polling |
+| `GET /parties/:code/notification-access` | notification link bearer | Validates that link specifically and returns its member's party state, regardless of any account cookie |
 | `PUT /parties/:code/media-consent` `{kind, granted}` | members | Lobby only; `kind` is `camera` or `photos`, `granted` is a boolean |
 | `PUT /parties/:code/photo` | members | Multipart `photo` + `x`, `y`, `zoom`, `source` (`camera` or `photos`), `shareConsent` (`true`); requires saved source consent; lobby only; replaces previous photo |
 | `POST /parties/:code/added-players` `{name}` | members | Lobby only; adds a phone-less player managed by the caller |
 | `DELETE /parties/:code/players/:id` | host, or the player's adder | Lobby only; deletes their photos and any players they added |
-| `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos |
+| `PUT /parties/:code/notification-email` `{email}` | member | Changes that member's notification address; revokes previous notification links. If called using a notification link, returns `replacementToken` for the current browser |
+| `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos; queues notifications transactionally |
 | `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing your own photo or after your reveal |
 | `POST /parties/:code/reveal` | members | Reveals and locks guesses for this player; party enters reveal phase after all players reveal |
 
@@ -108,6 +111,28 @@ Game state includes a stable, separately shuffled `views` entry for the member
 and each player they manage. Each view exposes faces and scores only after that
 player reveals. Scores are provisional until everyone has revealed. Existing
 parties already in the reveal phase remain revealed after migration.
+
+### Guessing notifications
+
+Starting guessing queues one email per direct member with an address. Managed
+players are covered by the member who added them. Existing guests without an
+address are shown a form and the host sees a warning; starting is not blocked.
+An address added during guessing queues that member's notification.
+Email addresses are private to the member and are not independently verified
+when entered by guests. SendGrid accepts the email for delivery; acceptance does
+not guarantee delivery. A database-backed worker retries failed sends with
+backoff and shows the host when a send is being retried. A crash or uncertain
+provider response can result in duplicate emails.
+
+Each notification has a random, party-scoped bearer link. Only its hash is
+stored; the token is in the URL fragment, not the HTTP request or server access
+logs, and SendGrid click tracking is disabled. The frontend removes the fragment
+and saves the token in browser storage after validation. The link can be used
+until the party expires or the member changes their notification email; anyone
+with it can act as that member (including managed players), but it does not
+grant access to their account or other parties. It can optionally be linked to
+an account through the normal email-code verification flow. Email links may be
+copied or forwarded, so recipients should keep them private.
 
 ### Photo privacy model
 

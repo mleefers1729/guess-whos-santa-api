@@ -47,6 +47,7 @@ ALTER TABLE players ADD COLUMN IF NOT EXISTS added_by uuid REFERENCES players (i
 ALTER TABLE players ADD COLUMN IF NOT EXISTS media_consent jsonb NOT NULL DEFAULT '{}';
 ALTER TABLE players ADD COLUMN IF NOT EXISTS account_id uuid REFERENCES accounts (id);
 ALTER TABLE players ADD COLUMN IF NOT EXISTS revealed_at timestamptz;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS notification_email text;
 UPDATE players SET revealed_at = now() FROM parties
   WHERE players.party_id = parties.id AND parties.phase = 'reveal' AND players.revealed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS players_party_account_idx ON players (party_id, account_id) WHERE account_id IS NOT NULL;
@@ -69,6 +70,19 @@ CREATE TABLE IF NOT EXISTS guesses (
   PRIMARY KEY (guesser_id, photo_id)
 );
 CREATE INDEX IF NOT EXISTS guesses_photo_idx ON guesses (photo_id);
+CREATE TABLE IF NOT EXISTS guess_notifications (
+  player_id uuid PRIMARY KEY REFERENCES players (id) ON DELETE CASCADE,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent')),
+  attempts integer NOT NULL DEFAULT 0,
+  next_attempt timestamptz NOT NULL DEFAULT now(),
+  lease_until timestamptz,
+  lease_id uuid
+);
+CREATE TABLE IF NOT EXISTS notification_links (
+  token_hash bytea PRIMARY KEY,
+  player_id uuid NOT NULL REFERENCES players (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS notification_links_player_idx ON notification_links (player_id);
 CREATE TABLE IF NOT EXISTS monitor_totals (
   id boolean PRIMARY KEY DEFAULT true CHECK (id),
   started_at timestamptz NOT NULL DEFAULT now(),
@@ -181,8 +195,8 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
           "SELECT phase FROM parties WHERE id = $1 FOR UPDATE", [partyId]);
         if (rows[0]?.phase !== 'lobby') return 'closed';
         await client.query(
-          'INSERT INTO players (id, party_id, name, token_hash, added_by, account_id) VALUES ($1, $2, $3, $4, $5, $6)',
-          [player.id, partyId, player.name, player.tokenHash, addedBy, player.accountId ?? null],
+          'INSERT INTO players (id, party_id, name, token_hash, added_by, account_id, notification_email) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+          [player.id, partyId, player.name, player.tokenHash, addedBy, player.accountId ?? null, player.notificationEmail ?? null],
         );
         await bump(client, partyId);
         return 'joined';
@@ -191,7 +205,12 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async snapshot(partyId) {
       const [players, photos, guesses] = await Promise.all([
-        pool.query('SELECT id, name, is_host, added_by, media_consent, revealed_at FROM players WHERE party_id = $1 ORDER BY created_at, id', [partyId]),
+        pool.query(`SELECT pl.id, pl.name, pl.is_host, pl.added_by, pl.media_consent, pl.revealed_at,
+          coalesce(pl.notification_email, a.email) AS notification_email, n.status AS notification_status,
+          n.attempts AS notification_attempts
+          FROM players pl LEFT JOIN accounts a ON a.id = pl.account_id
+          LEFT JOIN guess_notifications n ON n.player_id = pl.id
+          WHERE pl.party_id = $1 ORDER BY pl.created_at, pl.id`, [partyId]),
         pool.query('SELECT id, player_id, eyes_key, face_key FROM photos WHERE party_id = $1 ORDER BY id', [partyId]),
         pool.query(`
           SELECT g.guesser_id, g.photo_id, g.guessed_player_id
@@ -273,7 +292,87 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
         const count = await client.query('SELECT count(*)::int AS n FROM photos WHERE party_id = $1', [partyId]);
         if (count.rows[0].n < minimumPhotos) return 'not-enough-photos';
         await client.query('UPDATE parties SET phase = $2, version = version + 1 WHERE id = $1', [partyId, to]);
+        if (from === 'lobby' && to === 'guessing') {
+          await client.query(`
+            INSERT INTO guess_notifications (player_id)
+            SELECT pl.id FROM players pl LEFT JOIN accounts a ON a.id = pl.account_id
+            WHERE pl.party_id = $1 AND pl.added_by IS NULL
+              AND coalesce(pl.notification_email, a.email) IS NOT NULL
+            ON CONFLICT DO NOTHING`, [partyId]);
+        }
         return 'advanced';
+      });
+    },
+
+    async saveNotificationEmail({ partyId, playerId, email, replacementHash }) {
+      return transaction(pool, async (client) => {
+        const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
+        if (!rows[0]) return 'missing';
+        const existing = await client.query(`
+          SELECT coalesce(pl.notification_email, a.email) AS email FROM players pl
+          LEFT JOIN accounts a ON a.id = pl.account_id
+          WHERE pl.id = $1 AND pl.party_id = $2 AND pl.added_by IS NULL`, [playerId, partyId]);
+        if (!existing.rows[0]) return 'missing';
+        if (existing.rows[0].email === email) return 'unchanged';
+        const updated = await client.query(`
+          UPDATE players SET notification_email = $3 WHERE id = $1 AND party_id = $2 AND added_by IS NULL`,
+        [playerId, partyId, email]);
+        if (!updated.rowCount) return 'missing';
+        await client.query('DELETE FROM notification_links WHERE player_id = $1', [playerId]);
+        if (replacementHash) {
+          await client.query('INSERT INTO notification_links (token_hash, player_id) VALUES ($1, $2)', [replacementHash, playerId]);
+        }
+        if (rows[0].phase === 'guessing') {
+          await client.query(`
+            INSERT INTO guess_notifications (player_id) VALUES ($1)
+            ON CONFLICT (player_id) DO UPDATE SET status = 'pending', attempts = 0,
+              next_attempt = now(), lease_until = NULL, lease_id = NULL`, [playerId]);
+        }
+        await bump(client, partyId);
+        return 'saved';
+      });
+    },
+
+    async findNotificationPlayer(code, tokenHash) {
+      const { rows } = await pool.query(`
+        SELECT pl.id, pl.name, pl.is_host, pl.media_consent, pl.account_id,
+          pa.id AS party_id, pa.code, pa.phase, pa.version
+        FROM notification_links nl JOIN players pl ON pl.id = nl.player_id
+        JOIN parties pa ON pa.id = pl.party_id
+        WHERE nl.token_hash = $1 AND pa.code = $2
+          AND pa.created_at > now() - make_interval(days => $3)`, [tokenHash, code, retentionDays]);
+      return rows[0];
+    },
+
+    async claimGuessNotification({ tokenHash, leaseId }) {
+      return transaction(pool, async (client) => {
+        const { rows } = await client.query(`
+          SELECT n.player_id, pa.id AS party_id, pa.code, coalesce(pl.notification_email, a.email) AS email
+          FROM guess_notifications n JOIN players pl ON pl.id = n.player_id
+          JOIN parties pa ON pa.id = pl.party_id LEFT JOIN accounts a ON a.id = pl.account_id
+          WHERE pa.created_at > now() - make_interval(days => $1) AND pa.phase = 'guessing'
+            AND coalesce(pl.notification_email, a.email) IS NOT NULL
+            AND ((n.status = 'pending' AND n.next_attempt <= now())
+              OR (n.status = 'sending' AND n.lease_until < now()))
+          ORDER BY n.next_attempt FOR UPDATE OF n SKIP LOCKED LIMIT 1`, [retentionDays]);
+        const item = rows[0];
+        if (!item) return null;
+        await client.query(`
+          UPDATE guess_notifications SET status = 'sending', attempts = attempts + 1,
+            lease_id = $2, lease_until = now() + interval '2 minutes' WHERE player_id = $1`, [item.player_id, leaseId]);
+        await client.query('INSERT INTO notification_links (token_hash, player_id) VALUES ($1, $2)', [tokenHash, item.player_id]);
+        return item;
+      });
+    },
+
+    async finishGuessNotification({ playerId, partyId, leaseId, sent }) {
+      return transaction(pool, async (client) => {
+        const { rowCount } = await client.query(`
+          UPDATE guess_notifications SET status = $3, lease_id = NULL, lease_until = NULL,
+            next_attempt = now() + make_interval(secs => least(900, 15 * power(2, least(attempts, 6))::int))
+          WHERE player_id = $1 AND lease_id = $2`,
+        [playerId, leaseId, sent ? 'sent' : 'pending']);
+        if (rowCount) await bump(client, partyId);
       });
     },
 
@@ -374,7 +473,9 @@ function createAccountRepository(pool, retentionDays) {
         for (const claim of claims) {
           const found = await client.query(`
             SELECT pl.id, pl.account_id, pl.party_id FROM players pl JOIN parties pa ON pa.id = pl.party_id
-            WHERE pa.code = $1 AND pl.token_hash = $2 AND pl.added_by IS NULL
+            WHERE pa.code = $1 AND (pl.token_hash = $2 OR EXISTS (
+              SELECT 1 FROM notification_links nl WHERE nl.player_id = pl.id AND nl.token_hash = $2
+            )) AND pl.added_by IS NULL
               AND pa.created_at > now() - make_interval(days => $3) FOR UPDATE OF pl`,
           [claim.code, claim.tokenHash, retentionDays]);
           const player = found.rows[0];

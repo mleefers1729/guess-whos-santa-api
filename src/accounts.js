@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import express from 'express';
 import { rateLimit } from 'express-rate-limit';
-import { defaultPartyName } from './game.js';
+import { defaultPartyName, readEmail } from './game.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 const hash = (value) => createHash('sha256').update(value).digest();
@@ -124,10 +124,7 @@ export function createAccountAuth({ repository, secureCookies, rateLimitEnabled 
   router.get('/auth/session', async (req, res) => res.json(await accountState(req.account)));
 
   router.post('/auth/code', limit(10, 60), async (req, res) => {
-    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-    if (email.length > 254 || !/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i.test(email)) {
-      throw httpError(400, 'Enter a valid email address');
-    }
+    const email = readEmail(req.body?.email);
     if (!sendLoginCode) {
       console.error('Sign-in email delivery is not configured');
       return res.status(503).json({ error: 'Sign-in email is not configured yet. Please try again later.' });

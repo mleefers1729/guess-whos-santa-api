@@ -15,6 +15,14 @@ const imageTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 const hashToken = (token) => createHash('sha256').update(token).digest();
 
+export function readEmail(value) {
+  const email = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (email.length > 254 || !/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i.test(email)) {
+    throw httpError(400, 'Enter a valid email address');
+  }
+  return email;
+}
+
 function newCode() {
   return Array.from({ length: CODE_LENGTH }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join('');
 }
@@ -90,6 +98,11 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
       hasPhoto: Boolean(photo),
       guessCount: snapshot.guesses.filter((guess) => guess.guesser_id === player.id).length,
       revealed: Boolean(player.revealed_at),
+      canNotify: Boolean(player.notification_email || player.added_by),
+      ...(me.is_host && player.notification_status && {
+        notificationStatus: player.notification_status === 'pending' && player.notification_attempts > 0
+          ? 'retrying' : player.notification_status,
+      }),
       ...(crew.has(player.id) && {
         eyesUrl: photo ? storage.url(photo.eyes_key, expiresAt) : null,
         mediaConsent: player.media_consent,
@@ -102,7 +115,10 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
     name: party.name ?? defaultPartyName(snapshot.players.find((player) => player.is_host)?.name),
     phase: party.phase,
     version: party.version,
-    me: { id: me.id, name: me.name, isHost: me.is_host, hasPhoto: Boolean(myPhoto) },
+    me: {
+      id: me.id, name: me.name, isHost: me.is_host, hasPhoto: Boolean(myPhoto),
+      notificationEmail: snapshot.players.find((player) => player.id === me.id)?.notification_email ?? null,
+    },
     players,
     myEyesUrl: myPhoto ? storage.url(myPhoto.eyes_key, expiresAt) : null,
   };
@@ -157,9 +173,11 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
   async function authenticate(req, _res, next) {
     const code = readCode(req.params.code);
     const token = /^Bearer ([\w-]{20,100})$/.exec(req.get('authorization') ?? '')?.[1];
-    let me = req.account && await repository.findAccountPlayer(code, req.account.id);
+    const linked = token && await repository.findNotificationPlayer(code, hashToken(token));
+    req.notificationAccess = Boolean(linked);
+    let me = linked || (req.account && await repository.findAccountPlayer(code, req.account.id));
     if (!me && token) me = await repository.findPlayer(code, hashToken(token));
-    if (me?.account_id && me.account_id !== req.account?.id) {
+    if (!linked && me?.account_id && me.account_id !== req.account?.id) {
       throw httpError(401, 'Sign in to the account that saved this party');
     }
     if (!me) throw httpError(401, 'Join this party to continue');
@@ -172,7 +190,7 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     next();
   }
 
-  async function sendState(req, res, status = 200) {
+  async function sendState(req, res, status = 200, extra = {}) {
     const party = await repository.findParty(req.me.code);
     const snapshot = await repository.snapshot(req.me.party_id);
     const { state, etag } = buildState({ me: req.me, party, snapshot, storage });
@@ -180,7 +198,7 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     // Compared manually: fetch() adds Cache-Control: no-cache to conditional requests, which defeats req.fresh.
     const known = (req.get('if-none-match') ?? '').split(',').map((tag) => tag.trim());
     if (status === 200 && req.method === 'GET' && known.includes(etag)) return res.status(304).end();
-    res.status(status).json(state);
+    res.status(status).json({ ...state, ...extra });
   }
 
   router.post('/parties', limiter(20), async (req, res) => {
@@ -207,6 +225,7 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     if (existing) return res.json({ code: party.code, name: party.name, playerId: existing.id, account: true });
     const player = newPlayer(readName(req.body));
     player.accountId = req.account?.id;
+    player.notificationEmail = req.account ? null : readEmail(req.body?.email);
     let result;
     try {
       result = await repository.addPlayer({ partyId: party.id, player });
@@ -248,6 +267,14 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     next();
   }
 
+  router.get('/parties/:code/notification-access', limiter(60), async (req, res) => {
+    const token = /^Bearer ([\w-]{43})$/.exec(req.get('authorization') ?? '')?.[1];
+    const me = token && await repository.findNotificationPlayer(readCode(req.params.code), hashToken(token));
+    if (!me) throw httpError(401, 'This party link is invalid or has expired');
+    req.me = me;
+    await sendState(req, res);
+  });
+
   router.get('/parties/:code', authenticate, (req, res) => sendState(req, res));
 
   router.post('/parties/:code/added-players', limiter(60), authenticate, async (req, res) => {
@@ -263,6 +290,16 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     }
     if (result === 'closed') throw httpError(409, 'Players can only be added before guessing starts');
     await sendState(req, res, 201);
+  });
+
+  router.put('/parties/:code/notification-email', limiter(20), authenticate, async (req, res) => {
+    const replacementToken = req.notificationAccess ? randomBytes(32).toString('base64url') : undefined;
+    const result = await repository.saveNotificationEmail({
+      partyId: req.me.party_id, playerId: req.me.id, email: readEmail(req.body?.email),
+      replacementHash: replacementToken && hashToken(replacementToken),
+    });
+    if (result === 'missing') throw httpError(404, 'Player not found');
+    await sendState(req, res, 200, replacementToken && result === 'saved' ? { replacementToken } : {});
   });
 
   router.put('/parties/:code/media-consent', limiter(60), authenticate, actor, async (req, res) => {

@@ -6,6 +6,7 @@ import { readConfig } from './config.js';
 import { createRepository, migrate } from './db.js';
 import { createLocalStorage, createS3Storage } from './photos.js';
 import { createSendGridMailer } from './accounts.js';
+import { createGuessMailer, createNotificationWorker } from './notifications.js';
 
 const config = readConfig();
 const { caFile, ...databaseConfig } = config.database ?? {};
@@ -21,6 +22,7 @@ pool?.on('error', (error) => console.error('Idle database connection failed', er
 
 let repository;
 let cleanupTimer;
+let notificationTimer;
 if (pool) {
   await migrate(pool);
   repository = createRepository(pool, { retentionDays: config.photoRetentionDays });
@@ -30,6 +32,12 @@ if (pool) {
     .catch((error) => console.error('Expired party cleanup failed', error));
   await cleanup();
   cleanupTimer = setInterval(cleanup, 60 * 60 * 1000).unref();
+  const notifications = createNotificationWorker({
+    repository, sendGuessEmail: createGuessMailer(config.email), clientOrigin: config.clientOrigin,
+  });
+  const runNotifications = () => notifications.run().catch((error) => console.error('Guessing notification worker failed', error));
+  notificationTimer = setInterval(runNotifications, 5000).unref();
+  runNotifications();
 } else {
   console.warn('No DATABASE_HOST configured; party routes are disabled.');
 }
@@ -55,6 +63,7 @@ server.on('error', (error) => {
 
 function shutdown() {
   clearInterval(cleanupTimer);
+  clearInterval(notificationTimer);
   server.close(async () => {
     await pool?.end();
     process.exitCode = 0;

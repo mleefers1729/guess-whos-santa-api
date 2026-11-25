@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash, createVerify, generateKeyPairSync, randomBytes } from 'node:crypto';
+import { createHash, createVerify, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ import { createApp } from '../src/app.js';
 import { readConfig } from '../src/config.js';
 import { createRepository, migrate } from '../src/db.js';
 import { buildState } from '../src/game.js';
+import { createNotificationWorker } from '../src/notifications.js';
 import { createLocalStorage, createS3Storage, processPhoto } from '../src/photos.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -56,7 +57,7 @@ async function serve(t, options = {}) {
       method,
       headers: {
         'X-Santa-Request': '1',
-        ...(token && !sessionCookie && { Authorization: `Bearer ${token}` }),
+        ...(token && !token.startsWith('santa-session=') && { Authorization: `Bearer ${token}` }),
         ...(sessionCookie && { Cookie: sessionCookie }),
         ...(json && { 'Content-Type': 'application/json' }),
         ...headers,
@@ -102,8 +103,8 @@ function photoForm(buffer, fields = {}) {
 
 async function party(call, createHost) {
   const host = (await createHost({ name: 'Mom' })).body;
-  const ava = (await call('POST', `/api/parties/${host.code}/players`, { json: { name: 'Ava' } })).body;
-  const ben = (await call('POST', `/api/parties/${host.code.toLowerCase()}/players`, { json: { name: 'Ben' } })).body;
+  const ava = (await call('POST', `/api/parties/${host.code}/players`, { json: { name: 'Ava', email: 'ava@example.com' } })).body;
+  const ben = (await call('POST', `/api/parties/${host.code.toLowerCase()}/players`, { json: { name: 'Ben', email: 'ben@example.com' } })).body;
   for (const player of [host, ava, ben]) await allowPhotos(call, host.code, player.token);
   return { code: host.code, host, ava, ben };
 }
@@ -137,6 +138,100 @@ test('each managed player gets a stable shuffled order and their own reveal', ()
   assert.ok(added.santas.every((santa) => santa.faceUrl && santa.playerId));
 });
 
+test('guessing notifications retry and provide private party-scoped access', { skip }, async (t) => {
+  const { call, createHost, signIn } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
+  assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'No email' } })).status, 400);
+  assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'Bad email', email: 'invalid' } })).status, 400);
+  await pool.query('UPDATE players SET notification_email = NULL WHERE id = $1', [ava.playerId]);
+  const child = (await call('POST', `/api/parties/${code}/added-players`, {
+    token: ben.token, json: { name: 'Child' },
+  })).body.players.find((player) => player.name === 'Child');
+  for (const [player, color] of [[host, 'red'], [ben, 'blue']]) {
+    assert.equal((await call('PUT', `/api/parties/${code}/photo`, {
+      token: player.token, body: photoForm(await photo(color)),
+    })).status, 201);
+  }
+  const lobby = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.equal(lobby.players.find((player) => player.id === ava.playerId).canNotify, false);
+  assert.equal(lobby.players.find((player) => player.id === child.id).canNotify, true);
+  assert.ok(!JSON.stringify(lobby.players).includes('ben@example.com'));
+  assert.equal((await call('POST', `/api/parties/${code}/start`, { token: host.token })).status, 200);
+  const queued = await pool.query('SELECT player_id FROM guess_notifications ORDER BY player_id');
+  assert.deepEqual(new Set(queued.rows.map((row) => row.player_id)), new Set([host.playerId, ben.playerId]));
+
+  const abandonedToken = randomBytes(32).toString('base64url');
+  const repository = createRepository(pool);
+  const abandoned = await repository.claimGuessNotification({
+    tokenHash: createHash('sha256').update(abandonedToken).digest(), leaseId: randomUUID(),
+  });
+  assert.ok(abandoned);
+  await pool.query("UPDATE guess_notifications SET lease_until = now() - interval '1 second' WHERE player_id = $1", [abandoned.player_id]);
+  const messages = [];
+  let failBen = true;
+  const worker = createNotificationWorker({
+    repository, clientOrigin: 'https://example.com',
+    sendGuessEmail: async (message) => {
+      if (message.email === 'ben@example.com' && failBen) throw new Error('test failure');
+      messages.push(message);
+    },
+  });
+  await worker.run();
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: abandonedToken })).body.me.id, abandoned.player_id,
+    'a link sent before a worker crash remains valid after retry');
+  const pending = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.equal(pending.players.find((player) => player.id === ben.playerId).notificationStatus, 'retrying');
+  assert.equal(pending.players.find((player) => player.id === host.playerId).notificationStatus, 'sent');
+  assert.equal(messages.length, 1);
+  const hostLink = new URL(messages[0].link);
+  const hostToken = new URLSearchParams(hostLink.hash.slice(1)).get('access');
+  assert.equal(hostLink.pathname, `/p/${code}`);
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: hostToken })).body.me.id, host.playerId);
+  assert.equal((await call('GET', '/api/auth/session', { token: hostToken })).body.user, null);
+  const otherHost = (await createHost({ name: 'Other host' })).body;
+  assert.equal((await call('GET', `/api/parties/${otherHost.code}`, { token: hostToken })).status, 401);
+
+  failBen = false;
+  await pool.query("UPDATE guess_notifications SET next_attempt = now() WHERE player_id = $1", [ben.playerId]);
+  await worker.run();
+  const benToken = new URLSearchParams(new URL(messages.find((message) => message.email === 'ben@example.com').link).hash.slice(1)).get('access');
+  const benState = await call('GET', `/api/parties/${code}`, { token: benToken, cookie: host.token });
+  assert.equal(benState.body.me.id, ben.playerId, 'the link selects its own player even in another account session');
+  assert.ok(benState.body.views[child.id], 'the link retains access to managed players');
+  assert.equal((await call('GET', `/api/parties/${code}/notification-access`, {
+    token: 'x'.repeat(43), cookie: host.token,
+  })).status, 401, 'an account session cannot validate an invalid notification link');
+  assert.equal((await call('GET', `/api/parties/${code}/notification-access`, {
+    token: benToken, cookie: host.token,
+  })).body.me.id, ben.playerId);
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: 'x'.repeat(43) })).status, 401);
+  const benAccount = await signIn('ben@example.com', [{ code, token: benToken }]);
+  assert.deepEqual(benAccount.body.claimed, [code], 'a notification link can be linked after email verification');
+  await worker.run();
+  assert.equal(messages.length, 2, 'sent notifications are not sent again');
+
+  const changed = await call('PUT', `/api/parties/${code}/notification-email`, {
+    token: benToken, json: { email: 'new-ben@example.com' },
+  });
+  assert.equal(changed.status, 200);
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: benToken })).status, 401, 'changing email revokes old links');
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: changed.body.replacementToken })).body.me.id, ben.playerId);
+  const unchanged = await call('PUT', `/api/parties/${code}/notification-email`, {
+    token: changed.body.replacementToken, json: { email: 'new-ben@example.com' },
+  });
+  assert.equal(unchanged.body.replacementToken, undefined, 'saving the same email preserves access');
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: changed.body.replacementToken })).status, 200);
+  await worker.run();
+  assert.ok(messages.some((message) => message.email === 'new-ben@example.com'));
+  assert.equal((await call('PUT', `/api/parties/${code}/notification-email`, {
+    token: ava.token, json: { email: 'ava@example.com' },
+  })).status, 200);
+  await worker.run();
+  assert.ok(messages.some((message) => message.email === 'ava@example.com'), 'late email is notified during guessing');
+  await pool.query("UPDATE parties SET created_at = now() - interval '31 days' WHERE code = $1", [code]);
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: hostToken })).status, 401);
+});
+
 test('monitor requires the admin session and counts visits and retained parties', { skip }, async (t) => {
   const { call, signIn } = await serve(t);
   assert.equal((await call('GET', '/api/monitor/stats')).status, 401);
@@ -154,7 +249,7 @@ test('monitor requires the admin session and counts visits and retained parties'
   assert.equal((await call('POST', '/api/monitor/visit', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
   const created = await call('POST', '/api/parties', { cookie: adminUser.cookie, json: { name: 'Host' } });
   assert.equal(created.status, 201);
-  assert.equal((await call('POST', `/api/parties/${created.body.code}/players`, { json: { name: 'Guest' } })).status, 201);
+  assert.equal((await call('POST', `/api/parties/${created.body.code}/players`, { json: { name: 'Guest', email: 'guest@example.com' } })).status, 201);
 
   const stats = await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie });
   assert.equal(stats.headers.get('cache-control'), 'no-store');
@@ -210,7 +305,7 @@ test('guest and legacy-host access link only with the original token and retain 
   await pool.query('UPDATE players SET account_id = NULL, token_hash = $2 WHERE id = $1', [
     host.playerId, createHash('sha256').update(legacyToken).digest(),
   ]);
-  const guest = (await call('POST', `/api/parties/${host.code}/players`, { json: { name: 'Guest' } })).body;
+  const guest = (await call('POST', `/api/parties/${host.code}/players`, { json: { name: 'Guest', email: 'guest@example.com' } })).body;
   assert.ok(guest.token);
   const saved = await signIn(undefined, [{ code: host.code, token: legacyToken }]);
   assert.deepEqual(saved.body.claimed, [host.code]);
@@ -326,7 +421,7 @@ test('media consent is explicit, persisted per player, private to their crew, an
   const { call, directory, createHost } = await serve(t);
   const host = (await createHost({ name: 'Host' })).body;
   const code = host.code;
-  const guest = (await call('POST', `/api/parties/${code}/players`, { json: { name: 'Guest' } })).body;
+  const guest = (await call('POST', `/api/parties/${code}/players`, { json: { name: 'Guest', email: 'guest@example.com' } })).body;
   const path = `/api/parties/${code}/media-consent`;
   const upload = (fields = {}) => call('PUT', `/api/parties/${code}/photo`, {
     token: host.token, body: photoForm(image, fields),
@@ -380,7 +475,7 @@ test('a full party: masked eyes before reveal, real faces only for members after
   const { base, call, directory, createHost } = await serve(t);
   const { code, host, ava, ben } = await party(call, createHost);
   assert.match(code, /^[A-HJ-NP-Z2-9]{6}$/);
-  assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'ava ' } })).status, 409);
+  assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'ava ', email: 'ava@example.com' } })).status, 409);
 
   assert.equal((await call('GET', `/api/parties/${code}`)).status, 401);
   assert.equal((await call('GET', `/api/parties/${code}`, { token: 'x'.repeat(43) })).status, 401);
@@ -403,7 +498,7 @@ test('a full party: masked eyes before reveal, real faces only for members after
   assert.equal((await call('PUT', `/api/parties/${code}/media-consent`, {
     token: host.token, json: { kind: 'camera', granted: true },
   })).status, 409);
-  assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'Late' } })).status, 409);
+  assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'Late', email: 'late@example.com' } })).status, 409);
   assert.equal((await call('PUT', `/api/parties/${code}/photo`, {
     token: ava.token, body: photoForm(await photo('pink')),
   })).status, 409);
@@ -490,7 +585,7 @@ test('host manages the lobby and polling uses ETags', { skip }, async (t) => {
   assert.equal((await call('GET', `/api/parties/${code}`, {
     token: ava.token, headers: { 'If-None-Match': etag },
   })).status, 304);
-  await call('POST', `/api/parties/${code}/players`, { json: { name: 'Cy' } });
+  await call('POST', `/api/parties/${code}/players`, { json: { name: 'Cy', email: 'cy@example.com' } });
   assert.equal((await call('GET', `/api/parties/${code}`, {
     token: ava.token, headers: { 'If-None-Match': etag },
   })).status, 200);
@@ -651,7 +746,7 @@ test('hosts name and rename parties; invitees preview the name', { skip }, async
 
   await allowPhotos(call, named.code, named.token);
   await call('PUT', `/api/parties/${named.code}/photo`, { token: named.token, body: photoForm(await photo('red')) });
-  const guest = (await call('POST', `/api/parties/${named.code}/players`, { json: { name: 'Ava' } })).body;
+  const guest = (await call('POST', `/api/parties/${named.code}/players`, { json: { name: 'Ava', email: 'ava@example.com' } })).body;
   await allowPhotos(call, named.code, guest.token);
   await call('PUT', `/api/parties/${named.code}/photo`, { token: guest.token, body: photoForm(await photo('blue')) });
   assert.equal((await call('POST', `/api/parties/${named.code}/start`, { token: named.token })).status, 200);

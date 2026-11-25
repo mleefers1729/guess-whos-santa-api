@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createSendGridMailer } from '../src/accounts.js';
+import { createGuessMailer } from '../src/notifications.js';
 
 test('SendGrid sends the browser-bound code using the authenticated sender', async (t) => {
   const request = t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 202 }));
@@ -53,4 +54,15 @@ test('SendGrid failures propagate without exposing provider responses or credent
 test('incomplete email configuration disables delivery explicitly', () => {
   assert.equal(createSendGridMailer({ sender: 'signin@guesswhossanta.com' }), undefined);
   assert.equal(createSendGridMailer({ apiKey: 'test-key' }), undefined);
+});
+
+test('guessing emails contain private links without click tracking', async (t) => {
+  const request = t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 202 }));
+  const send = createGuessMailer({ apiKey: 'test-key', sender: 'signin@example.com' });
+  const link = `https://example.com/p/ABCDEF#access=${'a'.repeat(43)}`;
+  await send({ email: 'recipient@example.com', link });
+  const body = JSON.parse(request.mock.calls[0].arguments[1].body);
+  assert.deepEqual(body.tracking_settings.click_tracking, { enable: false, enable_text: false });
+  assert.ok(body.content.every((part) => part.value.includes(link)));
+  assert.match(body.content[0].value, /don't share/);
 });
