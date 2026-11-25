@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import cors from 'cors';
 import express from 'express';
 import { rateLimit } from 'express-rate-limit';
@@ -62,10 +62,11 @@ export async function createApp(config = readConfig()) {
         throw requestError(400, 'A photo file is required');
       }
 
+      const inputPath = join(incomingDir, basename(req.file.path));
       try {
         let result;
         try {
-          const image = sharp(req.file.path, { limitInputPixels: 20_000_000 });
+          const image = sharp(inputPath, { limitInputPixels: 20_000_000 });
           const metadata = await image.metadata();
           if (metadata.format !== imageTypes.get(req.file.mimetype) || (metadata.pages ?? 1) > 1) {
             throw new Error('Unsupported image content');
@@ -94,7 +95,7 @@ export async function createApp(config = readConfig()) {
           size: result.info.size,
         });
       } finally {
-        await rm(req.file.path, { force: true });
+        await rm(inputPath, { force: true });
       }
     });
 
