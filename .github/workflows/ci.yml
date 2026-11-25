@@ -77,12 +77,10 @@ jobs:
       - name: Check sign-in email readiness
         if: steps.revision.outputs.current == 'true'
         run: |
-          if [ "$(aws sesv2 get-account --query '[ProductionAccessEnabled,SendingEnabled]' --output text)" != $'True\tTrue' ]; then
-            echo "::error::SES must have production access and sending enabled in us-east-1 before deploying the account-required API."
-            exit 1
-          fi
-          if [ "$(aws sesv2 get-email-identity --email-identity guesswhossanta.com --query VerifiedForSendingStatus --output text)" != "True" ]; then
-            echo "::error::Complete the initial infrastructure setup and SES domain/DKIM verification before deploying the account-required API."
+          if [ "$(aws secretsmanager describe-secret --region us-east-2 \
+            --secret-id guesswhossanta/sendgrid-api-key \
+            --query 'length(VersionIdsToStages.*[?contains(@, `AWSCURRENT`)][])' --output text)" != "1" ]; then
+            echo "::error::The SendGrid secret must have a current version before deploying the account-required API."
             exit 1
           fi
       - name: Deploy API and infrastructure

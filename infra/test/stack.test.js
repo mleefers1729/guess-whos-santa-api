@@ -124,24 +124,28 @@ test('apiImageTag reuses an already-published API image instead of building one'
   assert.match(image, /cdk-hnb659fds-container-assets-111111111111-us-east-1:abc123"/);
 });
 
-test('sign-in email verifies the domain and restricts API sending to the approved sender', () => {
-  template.hasResourceProperties('AWS::SES::EmailIdentity', { EmailIdentity: 'guesswhossanta.com' });
+test('sign-in email injects the existing cross-region SendGrid secret only through the execution role', () => {
+  template.resourceCountIs('AWS::SES::EmailIdentity', 0);
   template.hasResourceProperties('AWS::ECS::TaskDefinition', {
     ContainerDefinitions: Match.arrayWith([Match.objectLike({
-      Environment: Match.arrayWith([{ Name: 'AUTH_EMAIL_FROM', Value: "Guess Who's Santa <signin@guesswhossanta.com>" }]),
+      Environment: Match.arrayWith([{ Name: 'AUTH_EMAIL_FROM', Value: 'signin@guesswhossanta.com' }]),
+      Secrets: Match.arrayWith([{
+        Name: 'SENDGRID_API_KEY',
+        ValueFrom: { 'Fn::Join': ['', [
+          'arn:', { Ref: 'AWS::Partition' },
+          ':secretsmanager:us-east-2:111111111111:secret:guesswhossanta/sendgrid-api-key-9mUh3W:guesswhossanta/sendgrid-api-key::',
+        ]] },
+      }]),
     })]),
   });
-  const statements = Object.values(template.findResources('AWS::IAM::Policy'))
-    .flatMap((policy) => policy.Properties.PolicyDocument.Statement)
-    .filter((statement) => [statement.Action].flat().includes('ses:SendEmail'));
-  assert.equal(statements.length, 1);
-  assert.notEqual(statements[0].Resource, '*');
-  assert.deepEqual(statements[0].Condition, { StringEquals: { 'ses:FromAddress': 'signin@guesswhossanta.com' } });
-  const identityId = Object.keys(template.findResources('AWS::SES::EmailIdentity'))[0];
-  template.hasResourceProperties('AWS::Route53::RecordSet', {
-    Type: 'CNAME', Name: { 'Fn::GetAtt': [identityId, 'DkimDNSTokenName1'] },
-    ResourceRecords: [{ 'Fn::GetAtt': [identityId, 'DkimDNSTokenValue1'] }],
-  });
+  const [task] = Object.values(template.findResources('AWS::ECS::TaskDefinition'));
+  const policies = Object.values(template.findResources('AWS::IAM::Policy'));
+  const secretReaders = policies.filter((policy) => policy.Properties.PolicyDocument.Statement.some((statement) =>
+    [statement.Action].flat().includes('secretsmanager:GetSecretValue') &&
+    JSON.stringify(statement.Resource).includes('sendgrid-api-key')));
+  assert.equal(secretReaders.length, 1);
+  assert.deepEqual(secretReaders[0].Properties.Roles, [{ Ref: task.Properties.ExecutionRoleArn['Fn::GetAtt'][0] }]);
+  assert.ok(!JSON.stringify(policies).includes('ses:'));
 });
 
 test('GitHub deployment trusts only the intended repository on main and separates publishing privileges', () => {
@@ -167,10 +171,12 @@ test('GitHub deployment trusts only the intended repository on main and separate
     const subject = conditions['token.actions.githubusercontent.com:sub'];
     subjects.add(subject);
     const statements = policiesFor(id);
-    assert.ok(statements.some((statement) => statement.Action === 'ses:GetAccount' && statement.Resource === '*'));
-    const identityRead = statements.find((statement) => statement.Action === 'ses:GetEmailIdentity');
-    assert.ok(JSON.stringify(identityRead.Resource).includes('SignInEmail'));
-    assert.ok(!statements.some((statement) => [statement.Action].flat().includes('ses:SendEmail')));
+    const secretRead = statements.find((statement) => statement.Action === 'secretsmanager:DescribeSecret');
+    assert.deepEqual(secretRead.Resource, { 'Fn::Join': ['', [
+      'arn:', { Ref: 'AWS::Partition' },
+      ':secretsmanager:us-east-2:111111111111:secret:guesswhossanta/sendgrid-api-key-9mUh3W',
+    ]] });
+    assert.ok(!statements.some((statement) => [statement.Action].flat().includes('secretsmanager:GetSecretValue')));
     if (subject === 'repo:mleefers1729@55854922/guess-whos-santa@1471782918:ref:refs/heads/main') {
       const s3 = statements.filter((statement) => [statement.Action].flat().some((action) => action.startsWith('s3:')));
       assert.ok(s3.some((statement) => [statement.Action].flat().includes('s3:PutObject')));

@@ -266,7 +266,7 @@ test('sessions renew active browsers, enforce idle and absolute expiry, and do n
 });
 
 test('email delivery failures are explicit and cannot produce a login session', { skip }, async (t) => {
-  for (const sendLoginCode of [undefined, async () => { throw new Error('Simulated SES outage'); }]) {
+  for (const sendLoginCode of [undefined, async () => { throw new Error('Simulated SendGrid outage'); }]) {
     const { call } = await serve(t, { sendLoginCode });
     const email = `${randomBytes(8).toString('hex')}@example.com`;
     const sent = await call('POST', '/api/auth/code', { json: { email } });

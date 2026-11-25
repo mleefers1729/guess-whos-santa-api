@@ -54,14 +54,15 @@ HttpOnly session cookie; no player token is returned for them.
 
 ### Passwordless accounts
 
-Configure `AUTH_EMAIL_FROM` with a verified SES sender in `AWS_REGION` and
-provide AWS credentials with `ses:SendEmail` on that identity. Missing delivery
+Configure `AUTH_EMAIL_FROM` with a SendGrid-authenticated email address (no display
+name) and `SENDGRID_API_KEY` with Mail Send permission. ECS injects the key from
+Secrets Manager; it is never stored in source or logged. Missing delivery
 configuration returns an explicit `503`; there is no log-code or development
 authentication bypass. Tests inject a fake mailer and do not send real email.
 
 | Route | Notes |
 | --- | --- |
-| `POST /auth/code` `{email}` | Sends a six-digit SES code; browser-bound HttpOnly challenge cookie, 10-minute expiry, 60-second resend cooldown and 5 sends/hour/email in PostgreSQL, plus IP limits |
+| `POST /auth/code` `{email}` | Sends a six-digit SendGrid code; browser-bound HttpOnly challenge cookie, 10-minute expiry, 60-second resend cooldown and 5 sends/hour/email in PostgreSQL, plus IP limits |
 | `POST /auth/verify` `{code, parties?: [{code, token}]}` | Maximum 5 attempts; one use; creates/loads verified account and sets session cookie. Valid legacy tokens link their existing player records; returns `{user, parties, claimed, rejected}` |
 | `GET /auth/session` | Returns `{user, parties}` from the database, or `{user: null, parties: []}`. Party records include code, name, phase, playerId, isHost |
 | `POST /auth/logout` | Revokes the current database session and clears cookies; other devices remain signed in |
@@ -167,8 +168,9 @@ Photo, media-consent and guess routes accept `?as=<playerId>` to act for a playe
 | `MEDIA_KEY_PAIR_ID` / `MEDIA_PRIVATE_KEY` | unset | CloudFront public key ID and private PEM for signed URLs; required in production |
 | `LOCAL_MEDIA_DIR` / `LOCAL_MEDIA_SECRET` | `./media` / random | Local photo storage and URL-signing secret when S3 is not configured |
 | `PHOTO_RETENTION_DAYS` | `30` | Party/photo lifetime |
-| `AUTH_EMAIL_FROM` | unset | Verified SES sender; required in production. Infrastructure sets `Guess Who's Santa <signin@guesswhossanta.com>` |
-| `AWS_REGION` | `us-east-1` | SES and S3 region; SES sandbox/identity status is regional |
+| `AUTH_EMAIL_FROM` | unset | SendGrid-authenticated email address; required in production. Infrastructure sets `signin@guesswhossanta.com`; emails display as Guess Who's Santa |
+| `SENDGRID_API_KEY` | unset | SendGrid key with Mail Send permission; required in production, injected from Secrets Manager in ECS |
+| `AWS_REGION` | `us-east-1` | S3 region |
 | `RATE_LIMIT` | on | Set `off` only for tests |
 
 ## Legacy upload tests, not the game upload API

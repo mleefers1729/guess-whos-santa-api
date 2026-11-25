@@ -74,6 +74,7 @@ test('production rejects unmasked uploads, insecure origin, and missing hosting 
     MEDIA_KEY_PAIR_ID: 'K123',
     MEDIA_PRIVATE_KEY: 'test-only',
     AUTH_EMAIL_FROM: 'signin@guesswhossanta.com',
+    SENDGRID_API_KEY: 'test-only',
   };
   assert.equal(readConfig(env).trustProxy, 2);
   assert.equal(readConfig(env).enableLocalUploads, false);
@@ -83,7 +84,7 @@ test('production rejects unmasked uploads, insecure origin, and missing hosting 
   assert.throws(() => readConfig({ ...env, ENABLE_LOCAL_UPLOADS: 'yes' }), /true or false/);
   assert.throws(() => readConfig({ ...env, CLIENT_ORIGIN: 'http://guesswhossanta.com' }), /HTTPS/);
   for (const key of ['ORIGIN_VERIFY_SECRET', 'DATABASE_HOST', 'DATABASE_PASSWORD', 'DATABASE_CA_FILE',
-    'MEDIA_BUCKET', 'REVEAL_BUCKET', 'MEDIA_KEY_PAIR_ID', 'MEDIA_PRIVATE_KEY', 'AUTH_EMAIL_FROM']) {
+    'MEDIA_BUCKET', 'REVEAL_BUCKET', 'MEDIA_KEY_PAIR_ID', 'MEDIA_PRIVATE_KEY', 'AUTH_EMAIL_FROM', 'SENDGRID_API_KEY']) {
     assert.throws(() => readConfig({ ...env, [key]: '' }), new RegExp(key));
   }
 });

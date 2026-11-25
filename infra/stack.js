@@ -18,7 +18,6 @@ import {
   aws_route53_targets as targets,
   aws_s3 as s3,
   aws_secretsmanager as secretsmanager,
-  aws_ses as ses,
   custom_resources as cr,
 } from 'aws-cdk-lib';
 
@@ -68,9 +67,8 @@ export class SantaStack extends Stack {
     const zone = route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
       hostedZoneId: hostedZoneId.valueAsString, zoneName: domain,
     });
-    const signInEmail = new ses.EmailIdentity(this, 'SignInEmail', {
-      identity: ses.Identity.publicHostedZone(zone),
-    });
+    const sendGridSecret = secretsmanager.Secret.fromSecretCompleteArn(this, 'SendGridSecret',
+      `arn:${this.partition}:secretsmanager:us-east-2:${this.account}:secret:guesswhossanta/sendgrid-api-key-9mUh3W`);
     const viewerCertificate = new acm.Certificate(this, 'ViewerCertificate', {
       domainName: domain, validation: acm.CertificateValidation.fromDns(zone),
     });
@@ -215,13 +213,14 @@ export class SantaStack extends Stack {
         MEDIA_KEY_PAIR_ID: publicKey.publicKeyId,
         PHOTO_RETENTION_DAYS: '30',
         AWS_REGION: this.region,
-        AUTH_EMAIL_FROM: `Guess Who's Santa <signin@${domain}>`,
+        AUTH_EMAIL_FROM: `signin@${domain}`,
       },
       secrets: {
         DATABASE_USER: ecs.Secret.fromSecretsManager(db.secret, 'username'),
         DATABASE_PASSWORD: ecs.Secret.fromSecretsManager(db.secret, 'password'),
         ORIGIN_VERIFY_SECRET: ecs.Secret.fromSecretsManager(originSecret, 'verify'),
         MEDIA_PRIVATE_KEY: ecs.Secret.fromSecretsManager(mediaPrivateKey),
+        SENDGRID_API_KEY: ecs.Secret.fromSecretsManager(sendGridSecret, 'guesswhossanta/sendgrid-api-key'),
       },
       logging: ecs.LogDrivers.awsLogs({ logGroup, streamPrefix: 'api' }),
       portMappings: [{ containerPort: 3000 }],
@@ -233,11 +232,6 @@ export class SantaStack extends Stack {
     });
     mediaBucket.grantReadWrite(task.taskRole, 'media/*');
     revealBucket.grantReadWrite(task.taskRole, 'reveals/*');
-    task.addToTaskRolePolicy(new iam.PolicyStatement({
-      actions: ['ses:SendEmail'],
-      resources: [signInEmail.emailIdentityArn],
-      conditions: { StringEquals: { 'ses:FromAddress': `signin@${domain}` } },
-    }));
     const service = new ecs.FargateService(this, 'ApiService', {
       cluster, taskDefinition: task, desiredCount: 2,
       assignPublicIp: true,
@@ -386,10 +380,7 @@ export class SantaStack extends Stack {
     const apiDeploy = deploymentRole('GitHubApiDeploy', 'guess-whos-santa-api', '1471785145');
     for (const role of [frontendDeploy, apiDeploy]) {
       role.addToPolicy(new iam.PolicyStatement({
-        actions: ['ses:GetAccount'], resources: ['*'],
-      }));
-      role.addToPolicy(new iam.PolicyStatement({
-        actions: ['ses:GetEmailIdentity'], resources: [signInEmail.emailIdentityArn],
+        actions: ['secretsmanager:DescribeSecret'], resources: [sendGridSecret.secretArn],
       }));
     }
     apiDeploy.addToPolicy(new iam.PolicyStatement({

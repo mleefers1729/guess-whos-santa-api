@@ -5,7 +5,7 @@ import { createApp } from './app.js';
 import { readConfig } from './config.js';
 import { createRepository, migrate } from './db.js';
 import { createLocalStorage, createS3Storage } from './photos.js';
-import { createSesMailer } from './accounts.js';
+import { createSendGridMailer } from './accounts.js';
 
 const config = readConfig();
 const { caFile, ...databaseConfig } = config.database ?? {};
@@ -42,7 +42,7 @@ const app = await createApp(config, {
   checkDatabase: pool ? () => pool.query('SELECT 1') : undefined,
   repository,
   storage,
-  sendLoginCode: createSesMailer(config.email),
+  sendLoginCode: createSendGridMailer(config.email),
 });
 const server = app.listen(config.port, config.host, () => {
   console.log(`Guess Who's Santa API listening on http://${config.host}:${config.port}`);

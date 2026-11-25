@@ -28,10 +28,12 @@ unchanged when moving files: those identify the existing production resources.
   protection and snapshot-on-removal. Secrets Manager holds DB/origin secrets.
 - One-week API/DB logs, target 5xx and DB-connection alarms. Alarm notification
   subscriptions and an AWS Budget still need configuring before public launch.
-- SES domain identity with Route 53 DKIM records for passwordless sign-in.
-  ECS can send only from `signin@guesswhossanta.com` on that identity; no SMTP
-  password or email API key is needed. Verification and SES production access
-  in **us-east-1** are required before public sign-in works.
+- SendGrid passwordless sign-in from `signin@guesswhossanta.com`.
+  ECS injects `SENDGRID_API_KEY` from the existing Secrets Manager secret
+  `guesswhossanta/sendgrid-api-key` in **us-east-2**, JSON field
+  `guesswhossanta/sendgrid-api-key`. The full secret ARN is imported by the stack;
+  only the task execution role can read its value. SendGrid domain authentication
+  and a key with Mail Send permission are required. No SES access is needed.
 - Strict CSP, HSTS, no framing, and camera-only-on-self Permissions-Policy.
   The CSP intentionally permits no advertising/tracking domains yet.
 
@@ -143,26 +145,26 @@ switch the API to account-required hosting.
 
 ### Enable sign-in email before opening hosting to users
 
-After deploying the stack, wait for the SES identity's DKIM/domain verification
-to complete and request SES production access in **us-east-1**. While in the
-SES sandbox, recipient addresses must also be verified. DNS delegation must be
-correct for the generated DKIM CNAMEs to verify. Review SES quotas, sender
-reputation, bounce/complaint monitoring and email costs before launch.
+Before deploying, authenticate the sending domain in SendGrid and store a key
+with Mail Send permission in the secret described above. Keep the key out of
+source, build arguments and logs. Review SendGrid quotas, sender reputation,
+bounce/complaint monitoring and email costs before launch. The stack does not
+manage SendGrid DNS records. Rotating the secret requires an ECS redeployment
+to inject the new value into running tasks.
 
-For an existing live site, do not switch to the new API while SES is restricted:
+For an existing live site, do not switch to the new API before SendGrid is ready:
 new party creation requires a verified account, and the previous frontend cannot
-create parties against that API. Bootstrap the email identity and deployment
-roles without changing the running API first, wait for domain verification and
-production access, then coordinate the API/frontend cutover. The full-stack
-`npm run deploy` command above also updates the API; it is not an email-only
-bootstrap command. Both automated deployments enforce email readiness.
+create parties against that API. Coordinate the API/frontend cutover. The
+full-stack `npm run deploy` command above also updates the API. Automated
+deployments check that the secret has a current version without reading the key;
+this is not proof of provider acceptance or inbox delivery.
 
 Tables migrate automatically. Existing anonymous party sessions keep working;
 users can link them by signing in from the browser that still holds their party
 tokens. A lost, previously unlinked host token cannot be recovered using a name
 or party code. Keep one canonical site origin so cookies are consistently sent.
 
-Validate with a real recipient after SES is enabled: verify once, create a
+Validate with a real recipient after the API deploys: verify once, create a
 party, close/reopen the site and recover it from **Your parties** without another
 code. Repeat after clearing local storage (cookies kept), then on another device
 using an email code. Sign-out must block further access on the signed-out device.
@@ -197,8 +199,8 @@ If either repository is recreated or renamed, update the corresponding trust pol
 Protect `main` in both repositories:
 anyone who can change and push its workflows can use that repository's role.
 The frontend role can read/write only the web bucket, invalidate this
-distribution, and check SES readiness. It cannot access player photos.
-The API role can check SES readiness and assume this account/region's existing CDK bootstrap roles;
+distribution, and describe the SendGrid secret (not read its value). It cannot access player photos.
+The API role can describe that secret and assume this account/region's existing CDK bootstrap roles;
 those roles can deploy infrastructure, so API `main` is a privileged boundary.
 
 Deploy this stack once from an authorized workstation. The workflows default to
@@ -220,14 +222,14 @@ The API workflow installs `infra/`, enables ARM64 builds, and runs CDK deploy
 against the existing stack, preserving CloudFormation ownership of ECS task
 definitions. The frontend publishes assets first and HTML last, retains old
 hashed assets, invalidates CloudFront, waits for completion and compares the
-live HTML with the build. Both workflows require a verified SES domain, sending
-enabled and SES production access; the frontend also checks the account API.
-Failure prevents account-dependent updates from being activated while email is
-restricted. After SES approval and initial setup, re-run the workflows or push
-again.
+live HTML with the build. Both workflows require a current SendGrid secret
+version; the frontend also checks the account API. Validate real sign-in email
+delivery after the API deployment and before the frontend deployment. Secret
+metadata checks cannot detect a revoked API key or a delivery problem.
 
-To create the SES identity and GitHub roles without switching the running API
-(done once for production), pass the live image's container-asset tag:
+To update infrastructure and GitHub roles without switching the API image,
+pass the live image's container-asset tag. Do not use this to migrate an SES-only
+image: the new environment requires the SendGrid-capable API.
 
 ```sh
 npm run deploy -- -c apiImageTag=CURRENT_IMAGE_TAG \

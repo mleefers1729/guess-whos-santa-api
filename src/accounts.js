@@ -1,5 +1,4 @@
 import { createHash, randomBytes, randomInt } from 'node:crypto';
-import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import express from 'express';
 import { rateLimit } from 'express-rate-limit';
 import { defaultPartyName } from './game.js';
@@ -19,21 +18,29 @@ function cookieSettings(secure) {
   return { httpOnly: true, secure, sameSite: 'lax', path: '/' };
 }
 
-export function createSesMailer({ region, sender }) {
-  if (!sender) return undefined;
-  const client = new SESv2Client({ region });
+export function createSendGridMailer({ apiKey, sender }) {
+  if (!apiKey || !sender) return undefined;
   return async ({ email, code }) => {
-    await client.send(new SendEmailCommand({
-      FromEmailAddress: sender,
-      Destination: { ToAddresses: [email] },
-      Content: { Simple: {
-        Subject: { Data: "Your Guess Who's Santa sign-in code", Charset: 'UTF-8' },
-        Body: { Text: {
-          Data: `Your sign-in code is ${code}.\n\nIt expires in 10 minutes and works only in the browser that requested it. Never share this code. If you did not request it, you can ignore this email.`,
-          Charset: 'UTF-8',
-        } },
-      } },
-    }));
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(10_000),
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email }] }],
+        from: { email: sender, name: "Guess Who's Santa" },
+        subject: "Your Guess Who's Santa sign-in code",
+        content: [{
+          type: 'text/plain',
+          value: `Your sign-in code is ${code}.\n\nIt expires in 10 minutes and works only in the browser that requested it. Never share this code. If you did not request it, you can ignore this email.`,
+        }],
+      }),
+    });
+    if (response.status !== 202) {
+      const error = new Error(`SendGrid rejected sign-in email (HTTP ${response.status})`);
+      error.name = 'SendGridDeliveryError';
+      error.status = response.status;
+      throw error;
+    }
   };
 }
 
@@ -97,7 +104,7 @@ export function createAccountAuth({ repository, secureCookies, rateLimitEnabled 
       await sendLoginCode({ email, code });
     } catch (error) {
       await repository.cancelLogin(tokenHash);
-      console.error('Sign-in email delivery failed', { name: error.name });
+      console.error('Sign-in email delivery failed', { name: error.name, status: error.status });
       return res.status(503).json({ error: 'Could not send your sign-in email. Please try again later.' });
     }
     res.cookie(loginName, token, { ...cookie, maxAge: 10 * 60 * 1000 });
