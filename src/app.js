@@ -9,6 +9,7 @@ import multer from 'multer';
 import sharp from 'sharp';
 import { readConfig } from './config.js';
 import { createGameRouter } from './game.js';
+import { createAccountAuth } from './accounts.js';
 
 const imageTypes = new Map([
   ['image/jpeg', 'jpeg'],
@@ -20,7 +21,7 @@ function requestError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
-export async function createApp(config = readConfig(), { checkDatabase, repository, storage } = {}) {
+export async function createApp(config = readConfig(), { checkDatabase, repository, storage, sendLoginCode } = {}) {
   if (config.database && !checkDatabase) {
     throw new Error('Database readiness check is required when a database is configured');
   }
@@ -86,6 +87,10 @@ export async function createApp(config = readConfig(), { checkDatabase, reposito
     });
   }
   if (repository && storage) {
+    const accounts = createAccountAuth({
+      repository, secureCookies: config.secureCookies, rateLimitEnabled: config.rateLimitEnabled, sendLoginCode,
+    });
+    app.use('/api', accounts.middleware, accounts.router);
     app.use('/api', createGameRouter({
       repository, storage, maxUploadBytes: config.maxUploadBytes, rateLimitEnabled: config.rateLimitEnabled,
     }));

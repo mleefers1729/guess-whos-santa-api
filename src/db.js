@@ -1,6 +1,30 @@
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+
 const MIGRATION_LOCK = 704_202_512;
 
 const schema = `
+CREATE TABLE IF NOT EXISTS accounts (
+  id uuid PRIMARY KEY,
+  email text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS account_sessions (
+  token_hash bytea PRIMARY KEY,
+  account_id uuid NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL DEFAULT now() + interval '90 days'
+);
+CREATE INDEX IF NOT EXISTS account_sessions_expiry_idx ON account_sessions (expires_at);
+CREATE TABLE IF NOT EXISTS login_codes (
+  email text PRIMARY KEY,
+  token_hash bytea NOT NULL UNIQUE,
+  code_hash bytea NOT NULL,
+  expires_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0,
+  sent_at timestamptz NOT NULL DEFAULT now(),
+  window_started_at timestamptz NOT NULL DEFAULT now(),
+  send_count integer NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS parties (
   id uuid PRIMARY KEY,
   code text NOT NULL UNIQUE,
@@ -21,6 +45,8 @@ CREATE TABLE IF NOT EXISTS players (
 -- Players added by another member (kids, anyone without a phone); that member acts for them.
 ALTER TABLE players ADD COLUMN IF NOT EXISTS added_by uuid REFERENCES players (id) ON DELETE CASCADE;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS media_consent jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS account_id uuid REFERENCES accounts (id);
+CREATE UNIQUE INDEX IF NOT EXISTS players_party_account_idx ON players (party_id, account_id) WHERE account_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS players_added_by_idx ON players (added_by);
 CREATE UNIQUE INDEX IF NOT EXISTS players_party_name_idx ON players (party_id, lower(name));
 CREATE TABLE IF NOT EXISTS photos (
@@ -70,19 +96,20 @@ export async function transaction(pool, work) {
 
 export function createRepository(pool, { retentionDays = 30 } = {}) {
   return {
+    ...createAccountRepository(pool, retentionDays),
     async createParty({ partyId, code, name, host }) {
       return transaction(pool, async (client) => {
         await client.query('INSERT INTO parties (id, code, name) VALUES ($1, $2, $3)', [partyId, code, name]);
         await client.query(
-          'INSERT INTO players (id, party_id, name, token_hash, is_host) VALUES ($1, $2, $3, $4, true)',
-          [host.id, partyId, host.name, host.tokenHash],
+          'INSERT INTO players (id, party_id, name, token_hash, is_host, account_id) VALUES ($1, $2, $3, $4, true, $5)',
+          [host.id, partyId, host.name, host.tokenHash, host.accountId],
         );
       });
     },
 
     async findPlayer(code, tokenHash) {
       const { rows } = await pool.query(`
-        SELECT pl.id, pl.name, pl.is_host, pl.media_consent, pa.id AS party_id, pa.code, pa.phase, pa.version
+        SELECT pl.id, pl.name, pl.is_host, pl.media_consent, pl.account_id, pa.id AS party_id, pa.code, pa.phase, pa.version
         FROM players pl JOIN parties pa ON pa.id = pl.party_id
         WHERE pa.code = $1 AND pl.token_hash = $2
           AND pa.created_at > now() - make_interval(days => $3)`, [code, tokenHash, retentionDays]);
@@ -106,8 +133,8 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
           "SELECT phase FROM parties WHERE id = $1 FOR UPDATE", [partyId]);
         if (rows[0]?.phase !== 'lobby') return 'closed';
         await client.query(
-          'INSERT INTO players (id, party_id, name, token_hash, added_by) VALUES ($1, $2, $3, $4, $5)',
-          [player.id, partyId, player.name, player.tokenHash, addedBy],
+          'INSERT INTO players (id, party_id, name, token_hash, added_by, account_id) VALUES ($1, $2, $3, $4, $5, $6)',
+          [player.id, partyId, player.name, player.tokenHash, addedBy, player.accountId ?? null],
         );
         await bump(client, partyId);
         return 'joined';
@@ -237,4 +264,113 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
 function bump(client, partyId) {
   return client.query('UPDATE parties SET version = version + 1 WHERE id = $1', [partyId]);
+}
+
+function createAccountRepository(pool, retentionDays) {
+  return {
+    async requestLogin({ email, tokenHash, codeHash }) {
+      const { rowCount } = await pool.query(`
+        INSERT INTO login_codes (email, token_hash, code_hash, expires_at)
+        VALUES ($1, $2, $3, now() + interval '10 minutes')
+        ON CONFLICT (email) DO UPDATE SET token_hash = EXCLUDED.token_hash,
+          code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at, attempts = 0, sent_at = now(),
+          window_started_at = CASE WHEN login_codes.window_started_at < now() - interval '1 hour' THEN now() ELSE login_codes.window_started_at END,
+          send_count = CASE WHEN login_codes.window_started_at < now() - interval '1 hour' THEN 1 ELSE login_codes.send_count + 1 END
+        WHERE login_codes.sent_at < now() - interval '1 minute'
+          AND (login_codes.window_started_at < now() - interval '1 hour' OR login_codes.send_count < 5)`,
+      [email, tokenHash, codeHash]);
+      return rowCount === 1;
+    },
+
+    async cancelLogin(tokenHash) {
+      await pool.query('UPDATE login_codes SET expires_at = now() WHERE token_hash = $1', [tokenHash]);
+    },
+
+    async verifyLogin({ tokenHash, codeHash, sessionHash, claims }) {
+      return transaction(pool, async (client) => {
+        const { rows } = await client.query(`
+          SELECT email, code_hash FROM login_codes WHERE token_hash = $1
+            AND expires_at > now() AND attempts < 5 FOR UPDATE`, [tokenHash]);
+        const challenge = rows[0];
+        if (!challenge) return null;
+        if (!timingSafeEqual(challenge.code_hash, codeHash)) {
+          await client.query('UPDATE login_codes SET attempts = attempts + 1 WHERE token_hash = $1', [tokenHash]);
+          return null;
+        }
+        await client.query('UPDATE login_codes SET expires_at = now(), attempts = 5 WHERE token_hash = $1', [tokenHash]);
+        const account = await client.query(`
+          INSERT INTO accounts (id, email) VALUES ($1, $2)
+          ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email RETURNING id, email`,
+        [randomUUID(), challenge.email]);
+        const user = account.rows[0];
+        await client.query('INSERT INTO account_sessions (token_hash, account_id) VALUES ($1, $2)', [sessionHash, user.id]);
+        const claimed = [];
+        const rejected = [];
+        for (const claim of claims) {
+          const found = await client.query(`
+            SELECT pl.id, pl.account_id, pl.party_id FROM players pl JOIN parties pa ON pa.id = pl.party_id
+            WHERE pa.code = $1 AND pl.token_hash = $2 AND pl.added_by IS NULL
+              AND pa.created_at > now() - make_interval(days => $3) FOR UPDATE OF pl`,
+          [claim.code, claim.tokenHash, retentionDays]);
+          const player = found.rows[0];
+          const existing = player && await client.query(
+            'SELECT id FROM players WHERE party_id = $1 AND account_id = $2', [player.party_id, user.id]);
+          if (!player || (player.account_id && player.account_id !== user.id) ||
+              (existing.rows[0] && existing.rows[0].id !== player.id)) {
+            rejected.push(claim.code);
+            continue;
+          }
+          await client.query('UPDATE players SET account_id = $2 WHERE id = $1', [player.id, user.id]);
+          claimed.push(claim.code);
+        }
+        return { user, claimed, rejected };
+      });
+    },
+
+    async findAccountSession(tokenHash) {
+      const { rows } = await pool.query(`
+        SELECT a.id, a.email, s.expires_at FROM account_sessions s JOIN accounts a ON a.id = s.account_id
+        WHERE s.token_hash = $1 AND s.expires_at > now() AND s.created_at > now() - interval '365 days'`, [tokenHash]);
+      const session = rows[0];
+      if (!session) return null;
+      const renewed = session.expires_at.getTime() < Date.now() + 89 * 24 * 60 * 60 * 1000;
+      if (renewed) {
+        const result = await pool.query(`
+          UPDATE account_sessions SET expires_at = least(now() + interval '90 days', created_at + interval '365 days')
+          WHERE token_hash = $1 AND expires_at > now()`, [tokenHash]);
+        if (!result.rowCount) return null;
+      }
+      return { user: { id: session.id, email: session.email }, renewed };
+    },
+
+    async deleteAccountSession(tokenHash) {
+      await pool.query('DELETE FROM account_sessions WHERE token_hash = $1', [tokenHash]);
+    },
+
+    async accountParties(accountId) {
+      const { rows } = await pool.query(`
+        SELECT pa.code, pa.name, pa.phase, pl.id AS player_id, pl.is_host,
+          host.name AS host_name
+        FROM players pl JOIN parties pa ON pa.id = pl.party_id
+          JOIN players host ON host.party_id = pa.id AND host.is_host
+        WHERE pl.account_id = $1 AND pa.created_at > now() - make_interval(days => $2)
+        ORDER BY pa.created_at DESC`, [accountId, retentionDays]);
+      return rows;
+    },
+
+    async findAccountPlayer(code, accountId) {
+      const { rows } = await pool.query(`
+        SELECT pl.id, pl.name, pl.is_host, pl.media_consent, pl.account_id,
+          pa.id AS party_id, pa.code, pa.phase, pa.version
+        FROM players pl JOIN parties pa ON pa.id = pl.party_id
+        WHERE pa.code = $1 AND pl.account_id = $2
+          AND pa.created_at > now() - make_interval(days => $3)`, [code, accountId, retentionDays]);
+      return rows[0];
+    },
+
+    async cleanupAccounts() {
+      await pool.query("DELETE FROM login_codes WHERE sent_at < now() - interval '1 day'");
+      await pool.query('DELETE FROM account_sessions WHERE expires_at < now()');
+    },
+  };
 }

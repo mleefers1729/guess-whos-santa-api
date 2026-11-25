@@ -5,6 +5,7 @@ import { createApp } from './app.js';
 import { readConfig } from './config.js';
 import { createRepository, migrate } from './db.js';
 import { createLocalStorage, createS3Storage } from './photos.js';
+import { createSesMailer } from './accounts.js';
 
 const config = readConfig();
 const { caFile, ...databaseConfig } = config.database ?? {};
@@ -23,7 +24,9 @@ let cleanupTimer;
 if (pool) {
   await migrate(pool);
   repository = createRepository(pool, { retentionDays: config.photoRetentionDays });
-  const cleanup = () => repository.deleteExpiredParties(config.photoRetentionDays)
+  const cleanup = () => Promise.all([
+    repository.deleteExpiredParties(config.photoRetentionDays), repository.cleanupAccounts(),
+  ])
     .catch((error) => console.error('Expired party cleanup failed', error));
   await cleanup();
   cleanupTimer = setInterval(cleanup, 60 * 60 * 1000).unref();
@@ -39,6 +42,7 @@ const app = await createApp(config, {
   checkDatabase: pool ? () => pool.query('SELECT 1') : undefined,
   repository,
   storage,
+  sendLoginCode: createSesMailer(config.email),
 });
 const server = app.listen(config.port, config.host, () => {
   console.log(`Guess Who's Santa API listening on http://${config.host}:${config.port}`);

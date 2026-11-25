@@ -44,7 +44,7 @@ function readPartyName(value, { optional = false } = {}) {
 }
 
 // Unnamed parties store null; members see "<host>’s party", but the public invite never shows the host's name.
-function defaultPartyName(hostName) {
+export function defaultPartyName(hostName) {
   if (!hostName) return DEFAULT_PARTY_NAME;
   const full = `${hostName}’s party`;
   return full.length <= PARTY_NAME_MAX ? full : DEFAULT_PARTY_NAME;
@@ -168,7 +168,11 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
   async function authenticate(req, _res, next) {
     const code = readCode(req.params.code);
     const token = /^Bearer ([\w-]{20,100})$/.exec(req.get('authorization') ?? '')?.[1];
-    const me = token && await repository.findPlayer(code, hashToken(token));
+    let me = req.account && await repository.findAccountPlayer(code, req.account.id);
+    if (!me && token) me = await repository.findPlayer(code, hashToken(token));
+    if (me?.account_id && me.account_id !== req.account?.id) {
+      throw httpError(401, 'Sign in to the account that saved this party');
+    }
     if (!me) throw httpError(401, 'Join this party to continue');
     req.me = me;
     next();
@@ -191,13 +195,15 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
   }
 
   router.post('/parties', limiter(20), async (req, res) => {
+    if (!req.account) throw httpError(401, 'Sign in with your email to host and save your party');
     const host = newPlayer(readName(req.body), true);
+    host.accountId = req.account.id;
     const name = readPartyName(req.body?.partyName, { optional: true });
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const code = newCode();
       try {
         await repository.createParty({ partyId: randomUUID(), code, name, host });
-        return res.status(201).json({ code, name: name ?? defaultPartyName(host.name), playerId: host.id, token: host.token });
+        return res.status(201).json({ code, name: name ?? defaultPartyName(host.name), playerId: host.id, account: true });
       } catch (error) {
         if (!isUniqueViolation(error)) throw error;
       }
@@ -208,7 +214,10 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
   router.post('/parties/:code/players', limiter(60), async (req, res) => {
     const party = await repository.findParty(readCode(req.params.code));
     if (!party) throw httpError(404, 'Party not found');
+    const existing = req.account && await repository.findAccountPlayer(party.code, req.account.id);
+    if (existing) return res.json({ code: party.code, name: party.name, playerId: existing.id, account: true });
     const player = newPlayer(readName(req.body));
+    player.accountId = req.account?.id;
     let result;
     try {
       result = await repository.addPlayer({ partyId: party.id, player });
@@ -217,7 +226,10 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
       throw error;
     }
     if (result === 'closed') throw httpError(409, 'This party has already started');
-    res.status(201).json({ code: party.code, name: party.name, playerId: player.id, token: player.token });
+    res.status(201).json({
+      code: party.code, name: party.name, playerId: player.id,
+      ...(req.account ? { account: true } : { token: player.token }),
+    });
   });
 
   // Public preview for the join screen; anyone with the code can see the party name.

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createVerify, generateKeyPairSync, randomBytes } from 'node:crypto';
+import { createHash, createVerify, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -35,23 +35,28 @@ after(async () => {
   await admin.end();
 });
 
-async function serve(t) {
+async function serve(t, options = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'santa-media-'));
+  const mail = new Map();
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const app = await createApp({ ...readConfig({}), rateLimitEnabled: false }, {
+  const app = await createApp({ ...readConfig({}), rateLimitEnabled: false, ...options.config }, {
     checkDatabase: () => pool.query('SELECT 1'),
     repository: createRepository(pool),
     storage: createLocalStorage({ directory, secret: 'test-secret' }),
+    sendLoginCode: Object.hasOwn(options, 'sendLoginCode') ? options.sendLoginCode : async ({ email, code }) => mail.set(email, code),
   });
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const call = async (method, path, { token, json, body, headers = {} } = {}) => {
+  const call = async (method, path, { token, cookie, json, body, headers = {} } = {}) => {
+    const sessionCookie = cookie ?? (token?.startsWith('santa-session=') ? token : undefined);
     const response = await fetch(base + path, {
       method,
       headers: {
-        ...(token && { Authorization: `Bearer ${token}` }),
+        'X-Santa-Request': '1',
+        ...(token && !sessionCookie && { Authorization: `Bearer ${token}` }),
+        ...(sessionCookie && { Cookie: sessionCookie }),
         ...(json && { 'Content-Type': 'application/json' }),
         ...headers,
       },
@@ -60,7 +65,27 @@ async function serve(t) {
     const text = await response.text();
     return { status: response.status, headers: response.headers, body: text ? JSON.parse(text) : undefined };
   };
-  return { base, call, directory };
+  const signIn = async (email = `${randomBytes(8).toString('hex')}@example.com`, parties = []) => {
+    const sent = await call('POST', '/api/auth/code', { json: { email } });
+    assert.equal(sent.status, 200);
+    const challenge = sent.headers.getSetCookie().find((value) => value.startsWith('santa-login=')).split(';')[0];
+    const verified = await call('POST', '/api/auth/verify', {
+      cookie: challenge, json: { code: mail.get(email.trim().toLowerCase()), parties },
+    });
+    assert.equal(verified.status, 200);
+    return {
+      ...verified,
+      cookie: verified.headers.getSetCookie().find((value) => value.startsWith('santa-session=')).split(';')[0],
+    };
+  };
+  const createHost = async (json) => {
+    const { cookie } = await signIn();
+    const result = await call('POST', '/api/parties', { cookie, json });
+    // Existing game cases use `token` for credentials; hosts now authenticate with a cookie.
+    if (result.status === 201) result.body.token = cookie;
+    return result;
+  };
+  return { base, call, directory, createHost, signIn, mail };
 }
 
 const photo = (background) => sharp({
@@ -74,8 +99,8 @@ function photoForm(buffer, fields = {}) {
   return form;
 }
 
-async function party(call) {
-  const host = (await call('POST', '/api/parties', { json: { name: 'Mom' } })).body;
+async function party(call, createHost) {
+  const host = (await createHost({ name: 'Mom' })).body;
   const ava = (await call('POST', `/api/parties/${host.code}/players`, { json: { name: 'Ava' } })).body;
   const ben = (await call('POST', `/api/parties/${host.code.toLowerCase()}/players`, { json: { name: 'Ben' } })).body;
   for (const player of [host, ava, ben]) await allowPhotos(call, host.code, player.token);
@@ -89,9 +114,162 @@ async function allowPhotos(call, code, token, as) {
   assert.equal(result.status, 200);
 }
 
+test('email accounts restore hosted parties across visits and API instances without local tokens', { skip }, async (t) => {
+  const { call, signIn } = await serve(t);
+  assert.equal((await call('POST', '/api/parties', { json: { name: 'Host' } })).status, 401);
+  const login = await signIn();
+  const cookie = login.cookie;
+  assert.match(login.headers.getSetCookie().find((value) => value.startsWith('santa-session=')), /HttpOnly/i);
+  assert.match(login.headers.getSetCookie().find((value) => value.startsWith('santa-session=')), /SameSite=Lax/i);
+  const created = await call('POST', '/api/parties', { cookie, json: { name: 'Host', partyName: 'Saved party' } });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.token, undefined, 'account credentials stay in an HttpOnly cookie');
+  const code = created.body.code;
+  assert.equal((await call('GET', `/api/parties/${code}`, { cookie })).body.me.isHost, true);
+  assert.equal((await call('POST', '/api/parties', {
+    cookie, json: { name: 'CSRF' }, headers: { 'X-Santa-Request': '' },
+  })).status, 403);
+  assert.equal((await call('POST', '/api/parties', {
+    cookie, json: { name: 'Cross-site' }, headers: { 'Sec-Fetch-Site': 'cross-site' },
+  })).status, 403);
+
+  const restarted = await serve(t);
+  const restored = await restarted.call('GET', '/api/auth/session', { cookie });
+  assert.equal(restored.body.user.id, login.body.user.id);
+  assert.equal(restored.body.parties.find((p) => p.code === code).name, 'Saved party');
+  await pool.query("UPDATE login_codes SET sent_at = now() - interval '2 minutes' WHERE email = $1", [login.body.user.email]);
+  const anotherDevice = await restarted.signIn(login.body.user.email);
+  assert.equal(anotherDevice.body.user.id, login.body.user.id);
+  assert.equal((await restarted.call('GET', `/api/parties/${code}`, { cookie: anotherDevice.cookie })).body.me.isHost, true);
+  await call('POST', '/api/auth/logout', { cookie });
+  assert.equal((await call('GET', '/api/auth/session', { cookie })).body.user, null);
+  assert.equal((await call('GET', `/api/parties/${code}`, { cookie })).status, 401);
+  assert.equal((await restarted.call('GET', `/api/parties/${code}`, { cookie: anotherDevice.cookie })).status, 200,
+    'signing out revokes only this device');
+});
+
+test('guest and legacy-host access link only with the original token and retain their player identity', { skip }, async (t) => {
+  const { call, createHost, signIn } = await serve(t);
+  const host = (await createHost({ name: 'Legacy host' })).body;
+  const legacyToken = randomBytes(32).toString('base64url');
+  await pool.query('UPDATE players SET account_id = NULL, token_hash = $2 WHERE id = $1', [
+    host.playerId, createHash('sha256').update(legacyToken).digest(),
+  ]);
+  const guest = (await call('POST', `/api/parties/${host.code}/players`, { json: { name: 'Guest' } })).body;
+  assert.ok(guest.token);
+  const saved = await signIn(undefined, [{ code: host.code, token: legacyToken }]);
+  assert.deepEqual(saved.body.claimed, [host.code]);
+  const returnedHost = await call('GET', `/api/parties/${host.code}`, { cookie: saved.cookie });
+  assert.equal(returnedHost.body.me.id, host.playerId);
+  assert.equal(returnedHost.body.me.isHost, true);
+  assert.equal((await call('GET', `/api/parties/${host.code}`, { token: legacyToken })).status, 401,
+    'a legacy token cannot bypass logout once linked');
+  const stolen = await signIn(undefined, [{ code: host.code, token: legacyToken }]);
+  assert.deepEqual(stolen.body.rejected, [host.code], 'a bound party cannot be moved to another account');
+  assert.deepEqual(stolen.body.parties, []);
+  const guestSaved = await signIn(undefined, [{ code: host.code, token: guest.token }]);
+  assert.equal((await call('GET', `/api/parties/${host.code}`, { cookie: guestSaved.cookie })).body.me.id, guest.playerId);
+  const rejoin = await call('POST', `/api/parties/${host.code}/players`, {
+    cookie: guestSaved.cookie, json: { name: 'A new duplicate name' },
+  });
+  assert.equal(rejoin.status, 200);
+  assert.equal(rejoin.body.playerId, guest.playerId);
+  assert.equal(rejoin.body.token, undefined);
+  const guessed = await signIn(undefined, [{ code: host.code, token: randomBytes(32).toString('base64url') }]);
+  assert.deepEqual(guessed.body.claimed, []);
+  assert.equal((await call('GET', `/api/parties/${host.code}`, { cookie: guessed.cookie })).status, 401);
+});
+
+test('email codes are browser-bound, single-use, time-limited, attempt-limited, and throttled per email', { skip }, async (t) => {
+  const { call, mail } = await serve(t);
+  const email = `${randomBytes(8).toString('hex')}@example.com`;
+  const sent = await call('POST', '/api/auth/code', { json: { email } });
+  assert.equal(sent.status, 200);
+  assert.ok(!JSON.stringify(sent.body).includes(mail.get(email)), 'the API never returns the code');
+  const cookie = sent.headers.getSetCookie()[0].split(';')[0];
+  assert.equal((await call('POST', '/api/auth/verify', { json: { code: mail.get(email) } })).status, 400);
+  assert.equal((await call('POST', '/api/auth/code', { json: { email: email.toUpperCase() } })).status, 429);
+  const wrong = mail.get(email) === '000000' ? '111111' : '000000';
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    assert.equal((await call('POST', '/api/auth/verify', { cookie, json: { code: wrong } })).status, 400);
+  }
+  assert.equal((await call('POST', '/api/auth/verify', { cookie, json: { code: mail.get(email) } })).status, 400);
+  for (let sentCount = 1; sentCount < 5; sentCount += 1) {
+    await pool.query("UPDATE login_codes SET sent_at = now() - interval '2 minutes' WHERE email = $1", [email]);
+    assert.equal((await call('POST', '/api/auth/code', { json: { email } })).status, 200);
+  }
+  await pool.query("UPDATE login_codes SET sent_at = now() - interval '2 minutes' WHERE email = $1", [email]);
+  assert.equal((await call('POST', '/api/auth/code', { json: { email } })).status, 429);
+  await pool.query("UPDATE login_codes SET window_started_at = now() - interval '2 hours' WHERE email = $1", [email]);
+  const fresh = await call('POST', '/api/auth/code', { json: { email } });
+  const freshCookie = fresh.headers.getSetCookie()[0].split(';')[0];
+  const verified = await call('POST', '/api/auth/verify', { cookie: freshCookie, json: { code: mail.get(email) } });
+  assert.equal(verified.status, 200);
+  assert.equal((await call('POST', '/api/auth/verify', { cookie: freshCookie, json: { code: mail.get(email) } })).status, 400);
+
+  const expiringEmail = `${randomBytes(8).toString('hex')}@example.com`;
+  const expiring = await call('POST', '/api/auth/code', { json: { email: expiringEmail } });
+  await pool.query('UPDATE login_codes SET expires_at = now() WHERE email = $1', [expiringEmail]);
+  assert.equal((await call('POST', '/api/auth/verify', {
+    cookie: expiring.headers.getSetCookie()[0].split(';')[0], json: { code: mail.get(expiringEmail) },
+  })).status, 400);
+});
+
+test('sessions renew active browsers, enforce idle and absolute expiry, and do not resurrect expired parties', { skip }, async (t) => {
+  const { call, signIn } = await serve(t);
+  const login = await signIn();
+  const id = login.body.user.id;
+  const host = (await call('POST', '/api/parties', { cookie: login.cookie, json: { name: 'Host' } })).body;
+  await pool.query("UPDATE account_sessions SET expires_at = now() + interval '1 day' WHERE account_id = $1", [id]);
+  const renewed = await call('GET', '/api/auth/session', { cookie: login.cookie });
+  assert.equal(renewed.body.user.id, id);
+  assert.ok(renewed.headers.getSetCookie().some((value) => /Max-Age=7776000/.test(value)));
+  await pool.query("UPDATE parties SET created_at = now() - interval '31 days' WHERE code = $1", [host.code]);
+  assert.deepEqual((await call('GET', '/api/auth/session', { cookie: login.cookie })).body.parties, []);
+  await pool.query("UPDATE account_sessions SET created_at = now() - interval '366 days' WHERE account_id = $1", [id]);
+  assert.equal((await call('GET', '/api/auth/session', { cookie: login.cookie })).body.user, null);
+  const again = await signIn();
+  await pool.query('UPDATE account_sessions SET expires_at = now() WHERE account_id = $1', [again.body.user.id]);
+  assert.equal((await call('GET', '/api/auth/session', { cookie: again.cookie })).body.user, null);
+});
+
+test('email delivery failures are explicit and cannot produce a login session', { skip }, async (t) => {
+  for (const sendLoginCode of [undefined, async () => { throw new Error('Simulated SES outage'); }]) {
+    const { call } = await serve(t, { sendLoginCode });
+    const email = `${randomBytes(8).toString('hex')}@example.com`;
+    const sent = await call('POST', '/api/auth/code', { json: { email } });
+    assert.equal(sent.status, 503);
+    assert.match(sent.body.error, /not configured|Could not send/);
+    assert.equal(sent.headers.getSetCookie().length, 0);
+    assert.equal((await call('GET', '/api/auth/session')).body.user, null);
+    const records = await pool.query('SELECT expires_at <= now() AS expired FROM login_codes WHERE email = $1', [email]);
+    if (records.rowCount) assert.equal(records.rows[0].expired, true);
+  }
+});
+
+test('HTTPS sign-in issues host-only Secure HttpOnly cookies and rejects cross-site auth writes', { skip }, async (t) => {
+  const { call, mail } = await serve(t, { config: { secureCookies: true } });
+  const email = `${randomBytes(8).toString('hex')}@example.com`;
+  assert.equal((await call('POST', '/api/auth/code', {
+    json: { email }, headers: { 'X-Santa-Request': '' },
+  })).status, 403);
+  const sent = await call('POST', '/api/auth/code', { json: { email } });
+  const challenge = sent.headers.getSetCookie()[0];
+  assert.match(challenge, /^__Host-santa-login=/);
+  const verified = await call('POST', '/api/auth/verify', {
+    cookie: challenge.split(';')[0], json: { code: mail.get(email) },
+  });
+  assert.equal(verified.status, 200);
+  const cookie = verified.headers.getSetCookie().find((value) => value.startsWith('__Host-santa-session='));
+  assert.match(cookie, /;\s*Secure/i);
+  assert.match(cookie, /;\s*HttpOnly/i);
+  assert.match(cookie, /;\s*Path=\//i);
+  assert.ok(!/;\s*Domain=/i.test(cookie));
+});
+
 test('media consent is explicit, persisted per player, private to their crew, and required for uploads', { skip }, async (t) => {
-  const { call, directory } = await serve(t);
-  const host = (await call('POST', '/api/parties', { json: { name: 'Host' } })).body;
+  const { call, directory, createHost } = await serve(t);
+  const host = (await createHost({ name: 'Host' })).body;
   const code = host.code;
   const guest = (await call('POST', `/api/parties/${code}/players`, { json: { name: 'Guest' } })).body;
   const path = `/api/parties/${code}/media-consent`;
@@ -144,8 +322,8 @@ test('media consent is explicit, persisted per player, private to their crew, an
 });
 
 test('a full party: masked eyes before reveal, real faces only for members after reveal', { skip }, async (t) => {
-  const { base, call, directory } = await serve(t);
-  const { code, host, ava, ben } = await party(call);
+  const { base, call, directory, createHost } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
   assert.match(code, /^[A-HJ-NP-Z2-9]{6}$/);
   assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'ava ' } })).status, 409);
 
@@ -212,7 +390,7 @@ test('a full party: masked eyes before reveal, real faces only for members after
   assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: ben.token })).status, 403);
   const revealed = await call('POST', `/api/parties/${code}/reveal`, { token: host.token });
   assert.equal(revealed.body.phase, 'reveal');
-  const outsider = (await call('POST', '/api/parties', { json: { name: 'Stranger' } })).body;
+  const outsider = (await createHost({ name: 'Stranger' })).body;
   assert.equal((await call('GET', `/api/parties/${code}`, { token: outsider.token })).status, 401);
 
   const reveal = (await call('GET', `/api/parties/${code}`, { token: ben.token })).body;
@@ -231,8 +409,8 @@ test('a full party: masked eyes before reveal, real faces only for members after
 });
 
 test('host manages the lobby and polling uses ETags', { skip }, async (t) => {
-  const { call } = await serve(t);
-  const { code, host, ava, ben } = await party(call);
+  const { call, createHost } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
   assert.equal((await call('DELETE', `/api/parties/${code}/players/${ben.playerId}`, { token: ava.token })).status, 403);
   assert.equal((await call('DELETE', `/api/parties/${code}/players/${host.playerId}`, { token: host.token })).status, 400);
   assert.equal((await call('DELETE', `/api/parties/${code}/players/not-a-uuid`, { token: host.token })).status, 404);
@@ -260,11 +438,11 @@ test('host manages the lobby and polling uses ETags', { skip }, async (t) => {
 });
 
 test('rejects bad names, codes, images, and alignment', { skip }, async (t) => {
-  const { call } = await serve(t);
-  assert.equal((await call('POST', '/api/parties', { json: { name: ' ' } })).status, 400);
-  assert.equal((await call('POST', '/api/parties', { json: { name: '<b>' } })).status, 400);
+  const { call, createHost } = await serve(t);
+  assert.equal((await createHost({ name: ' ' })).status, 400);
+  assert.equal((await createHost({ name: '<b>' })).status, 400);
   assert.equal((await call('POST', '/api/parties/NOPE!!/players', { json: { name: 'A' } })).status, 404);
-  const { code, host } = await party(call);
+  const { code, host } = await party(call, createHost);
   const bad = await call('PUT', `/api/parties/${code}/photo`, {
     token: host.token, body: photoForm(Buffer.from('not an image')),
   });
@@ -309,8 +487,8 @@ test('production face URLs are CloudFront-signed, path-scoped, and short-lived',
 });
 
 test('members add players without phones and play for them', { skip }, async (t) => {
-  const { call } = await serve(t);
-  const { code, host, ava, ben } = await party(call);
+  const { call, createHost } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
   const added = await call('POST', `/api/parties/${code}/added-players`, { token: ava.token, json: { name: 'Tiny Tim' } });
   assert.equal(added.status, 201);
   const tim = added.body.players.find((p) => p.name === 'Tiny Tim');
@@ -362,8 +540,8 @@ test('members add players without phones and play for them', { skip }, async (t)
 });
 
 test('added players are removed by their adder or the host, and leave with their adder', { skip }, async (t) => {
-  const { call, directory } = await serve(t);
-  const { code, host, ava, ben } = await party(call);
+  const { call, directory, createHost } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
   const add = async (token, name) => (await call('POST', `/api/parties/${code}/added-players`, { token, json: { name } }))
     .body.players.find((p) => p.name === name);
   const tim = await add(ava.token, 'Tim');
@@ -381,10 +559,10 @@ test('added players are removed by their adder or the host, and leave with their
 });
 
 test('hosts name and rename parties; invitees preview the name', { skip }, async (t) => {
-  const { call } = await serve(t);
-  const named = (await call('POST', '/api/parties', { json: { name: 'Mom', partyName: '  Smith   Family Christmas ' } })).body;
+  const { call, createHost } = await serve(t);
+  const named = (await createHost({ name: 'Mom', partyName: '  Smith   Family Christmas ' })).body;
   assert.equal(named.name, 'Smith Family Christmas');
-  const { code, host, ava } = await party(call);
+  const { code, host, ava } = await party(call, createHost);
   assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.name, 'Mom’s party');
   assert.deepEqual((await call('GET', `/api/parties/${code}/invite`)).body, { code, name: null, open: true }, 'host name stays private');
   assert.deepEqual((await call('GET', `/api/parties/${named.code}/invite`)).body, { code: named.code, name: 'Smith Family Christmas', open: true });
@@ -397,7 +575,7 @@ test('hosts name and rename parties; invitees preview the name', { skip }, async
   assert.equal(renamed.status, 200);
   assert.equal(renamed.body.name, 'Work Holiday Party');
   assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.name, 'Work Holiday Party');
-  assert.equal((await call('POST', '/api/parties', { json: { name: 'Mom', partyName: '<b>' } })).status, 400);
+  assert.equal((await createHost({ name: 'Mom', partyName: '<b>' })).status, 400);
 
   await allowPhotos(call, named.code, named.token);
   await call('PUT', `/api/parties/${named.code}/photo`, { token: named.token, body: photoForm(await photo('red')) });

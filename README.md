@@ -28,11 +28,44 @@ TEST_DATABASE_URL=postgres://santa:santa-local-only@127.0.0.1:5432/santa npm tes
 All routes are under `/api`, return `Cache-Control: no-store`, and use JSON
 errors `{ "error": "message" }`. Players authenticate with
 `Authorization: Bearer <token>`; the token is returned once on create/join and
-only its SHA-256 hash is stored.
+only its SHA-256 hash is stored. Account-backed players instead use a persistent
+HttpOnly session cookie; no player token is returned for them.
+
+### Passwordless accounts
+
+Configure `AUTH_EMAIL_FROM` with a verified SES sender in `AWS_REGION` and
+provide AWS credentials with `ses:SendEmail` on that identity. Missing delivery
+configuration returns an explicit `503`; there is no log-code or development
+authentication bypass. Tests inject a fake mailer and do not send real email.
+
+| Route | Notes |
+| --- | --- |
+| `POST /auth/code` `{email}` | Sends a six-digit SES code; browser-bound HttpOnly challenge cookie, 10-minute expiry, 60-second resend cooldown and 5 sends/hour/email in PostgreSQL, plus IP limits |
+| `POST /auth/verify` `{code, parties?: [{code, token}]}` | Maximum 5 attempts; one use; creates/loads verified account and sets session cookie. Valid legacy tokens link their existing player records; returns `{user, parties, claimed, rejected}` |
+| `GET /auth/session` | Returns `{user, parties}` from the database, or `{user: null, parties: []}`. Party records include code, name, phase, playerId, isHost |
+| `POST /auth/logout` | Revokes the current database session and clears cookies; other devices remain signed in |
+
+Sessions use random opaque tokens (only hashes stored), `HttpOnly`,
+`SameSite=Lax`, path `/`, and `Secure`/`__Host-` names with HTTPS/production.
+They renew at most daily, expire after 90 idle days, and have a one-year
+absolute lifetime. Sign in again on another device or after cookies are cleared.
+Non-read requests using account cookies and all `/auth/*` writes require
+`X-Santa-Request: 1`; cross-site Fetch Metadata is rejected. Use the same-origin
+`/api` proxy, not cross-origin cookies. Account session routes never cache.
+
+Hosts must sign in before creating a party. Anonymous guests still use the
+existing bearer flow and may optionally link their saved parties on sign-in.
+Signing in never grants access by party code or display name alone, never
+moves a player already bound to another account, and preserves managed players,
+photos and guesses. Once linked, a legacy token cannot bypass account sign-out.
+Accounts/emails are independent of party retention; expired parties are not
+recovered or extended by logging in. Expired sessions and code records are
+cleaned hourly. Codes are salted by a random browser-only challenge token
+before hashing and are never logged or returned by the API.
 
 | Route | Who | Notes |
 | --- | --- | --- |
-| `POST /parties` `{name, partyName?}` | anyone | Creates a party and host; party name defaults to "<host>’s party" for members; returns `{code, name, playerId, token}` |
+| `POST /parties` `{name, partyName?}` | signed-in account | Creates a saved party and host; party name defaults to "<host>’s party" for members; returns `{code, name, playerId, account: true}` |
 | `GET /parties/:code/invite` | anyone with the code | `{code, name, open}` for the join screen; `name` is null unless the host set one and the lobby is open (never exposes the host's name) |
 | `PATCH /parties/:code` `{name}` | host | Renames the party (1-40 characters) |
 | `POST /parties/:code/players` `{name}` | anyone with the code | Lobby only; names unique per party (case-insensitive) |
@@ -113,6 +146,8 @@ Photo, media-consent and guess routes accept `?as=<playerId>` to act for a playe
 | `MEDIA_KEY_PAIR_ID` / `MEDIA_PRIVATE_KEY` | unset | CloudFront public key ID and private PEM for signed URLs; required in production |
 | `LOCAL_MEDIA_DIR` / `LOCAL_MEDIA_SECRET` | `./media` / random | Local photo storage and URL-signing secret when S3 is not configured |
 | `PHOTO_RETENTION_DAYS` | `30` | Party/photo lifetime |
+| `AUTH_EMAIL_FROM` | unset | Verified SES sender; required in production. Infrastructure sets `Guess Who's Santa <signin@guesswhossanta.com>` |
+| `AWS_REGION` | `us-east-1` | SES and S3 region; SES sandbox/identity status is regional |
 | `RATE_LIMIT` | on | Set `off` only for tests |
 
 ## Legacy upload tests, not the game upload API

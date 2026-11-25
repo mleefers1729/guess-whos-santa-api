@@ -32,7 +32,7 @@ export function readConfig(env = process.env) {
     }
   }
   if (production) {
-    for (const key of ['MEDIA_BUCKET', 'REVEAL_BUCKET', 'MEDIA_KEY_PAIR_ID', 'MEDIA_PRIVATE_KEY']) {
+    for (const key of ['MEDIA_BUCKET', 'REVEAL_BUCKET', 'MEDIA_KEY_PAIR_ID', 'MEDIA_PRIVATE_KEY', 'AUTH_EMAIL_FROM']) {
       if (!env[key]) throw new Error(`${key} is required in production`);
     }
   }
@@ -49,6 +49,8 @@ export function readConfig(env = process.env) {
     host: env.HOST ?? '127.0.0.1',
     port: positiveInteger(env.PORT, 3000, 'PORT', 65535),
     clientOrigin,
+    secureCookies: production || url.protocol === 'https:',
+    email: { region: env.AWS_REGION ?? 'us-east-1', sender: env.AUTH_EMAIL_FROM },
     enableLocalUploads,
     originVerifySecret: env.ORIGIN_VERIFY_SECRET,
     trustProxy: production ? 2 : false,
