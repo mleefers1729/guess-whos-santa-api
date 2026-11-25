@@ -114,7 +114,8 @@ test('a full party: masked eyes before reveal, real faces only for members after
   const serialized = JSON.stringify(guessing);
   assert.ok(!serialized.includes('reveals/'), 'no face URLs before reveal');
   for (const santa of guessing.santas) {
-    assert.deepEqual(Object.keys(santa).sort(), ['eyesUrl', 'id', 'isMine', 'myGuess', 'number']);
+    assert.deepEqual(Object.keys(santa).sort(), ['eyesUrl', 'guesses', 'id', 'isMine', 'myGuess', 'number', 'ownerId']);
+    assert.ok(santa.ownerId === null || santa.isMine, 'owners of other Santas stay hidden');
   }
   const eyes = await fetch(base + guessing.santas[0].eyesUrl);
   assert.equal(eyes.status, 200);
@@ -240,4 +241,99 @@ test('production face URLs are CloudFront-signed, path-scoped, and short-lived',
   }] });
   const signature = url.searchParams.get('Signature').replace(/-/g, '+').replace(/_/g, '=').replace(/~/g, '/');
   assert.ok(createVerify('RSA-SHA1').update(policy).verify(publicKey, signature, 'base64'));
+});
+
+test('members add players without phones and play for them', { skip }, async (t) => {
+  const { call } = await serve(t);
+  const { code, host, ava, ben } = await party(call);
+  const added = await call('POST', `/api/parties/${code}/added-players`, { token: ava.token, json: { name: 'Tiny Tim' } });
+  assert.equal(added.status, 201);
+  const tim = added.body.players.find((p) => p.name === 'Tiny Tim');
+  assert.equal(tim.addedBy, ava.playerId);
+  assert.equal((await call('POST', `/api/parties/${code}/added-players`, { json: { name: 'Nope' } })).status, 401);
+  assert.equal((await call('POST', `/api/parties/${code}/added-players`, { token: ben.token, json: { name: 'tiny tim' } })).status, 409);
+  const ben2 = (await call('POST', `/api/parties/${code}/added-players`, { token: ben.token, json: { name: 'Baby Bo' } })).body
+    .players.find((p) => p.name === 'Baby Bo');
+
+  const upload = (token, as, color) => call('PUT', `/api/parties/${code}/photo${as ? `?as=${as}` : ''}`, {
+    token, body: photoForm(color),
+  });
+  assert.equal((await upload(ben.token, tim.id, await photo('red'))).status, 404, "can't act for someone else's player");
+  const timPhoto = await upload(ava.token, tim.id, await photo('green'));
+  assert.equal(timPhoto.status, 201);
+  assert.equal(timPhoto.body.me.hasPhoto, false, 'photo belongs to Tim, not Ava');
+  assert.ok(timPhoto.body.players.find((p) => p.id === tim.id).eyesUrl);
+  assert.equal((await upload(host.token, null, await photo('blue'))).status, 201);
+  assert.equal((await upload(ben.token, ben2.id, await photo('pink'))).status, 201);
+  assert.equal((await call('POST', `/api/parties/${code}/start`, { token: host.token })).status, 200);
+
+  const state = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  const timSanta = state.santas.find((santa) => santa.ownerId === tim.id);
+  assert.ok(timSanta && !timSanta.isMine);
+  assert.equal(state.santas.filter((santa) => santa.ownerId).length, 1, 'only my crew owners are visible');
+  const other = state.santas.find((santa) => !santa.ownerId);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${timSanta.id}`, {
+    token: ava.token, json: { playerId: tim.id },
+  })).status, 400, "Ava can't score on the Santa she uploaded");
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${timSanta.id}?as=${tim.id}`, {
+    token: ava.token, json: { playerId: host.playerId },
+  })).status, 400, 'Tim cannot guess his own Santa');
+  const guessed = await call('PUT', `/api/parties/${code}/guesses/${other.id}?as=${tim.id}`, {
+    token: ava.token, json: { playerId: host.playerId },
+  });
+  assert.equal(guessed.status, 200);
+  const card = guessed.body.santas.find((santa) => santa.id === other.id);
+  assert.deepEqual([card.guesses[tim.id], card.myGuess], [host.playerId, null], "Tim's guess is separate from Ava's");
+  assert.equal(guessed.body.players.find((p) => p.id === tim.id).guessCount, 1);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${other.id}?as=${tim.id}`, {
+    token: ben.token, json: { playerId: host.playerId },
+  })).status, 404);
+
+  const revealed = (await call('POST', `/api/parties/${code}/reveal`, { token: host.token })).body;
+  assert.ok(revealed.leaderboard.some((row) => row.playerId === tim.id));
+  assert.equal(revealed.santas.find((santa) => santa.playerId === tim.id).faceUrl.includes('reveals/'), true);
+});
+
+test('added players are removed by their adder or the host, and leave with their adder', { skip }, async (t) => {
+  const { call, directory } = await serve(t);
+  const { code, host, ava, ben } = await party(call);
+  const add = async (token, name) => (await call('POST', `/api/parties/${code}/added-players`, { token, json: { name } }))
+    .body.players.find((p) => p.name === name);
+  const tim = await add(ava.token, 'Tim');
+  const sue = await add(ava.token, 'Sue');
+  const bo = await add(ben.token, 'Bo');
+  assert.equal((await call('PUT', `/api/parties/${code}/photo?as=${sue.id}`, { token: ava.token, body: photoForm(await photo('red')) })).status, 201);
+
+  assert.equal((await call('DELETE', `/api/parties/${code}/players/${bo.id}`, { token: ava.token })).status, 403);
+  assert.equal((await call('DELETE', `/api/parties/${code}/players/${tim.id}`, { token: ava.token })).status, 200);
+  assert.equal((await call('DELETE', `/api/parties/${code}/players/${bo.id}`, { token: host.token })).status, 200);
+  const after = await call('DELETE', `/api/parties/${code}/players/${ava.playerId}`, { token: host.token });
+  assert.deepEqual(after.body.players.map((p) => p.name), ['Mom', 'Ben'], "Ava's added players leave with her");
+  assert.equal((await readdir(directory, { recursive: true })).filter((file) => file.endsWith('.webp')).length, 0);
+});
+
+test('hosts name and rename parties; invitees preview the name', { skip }, async (t) => {
+  const { call } = await serve(t);
+  const named = (await call('POST', '/api/parties', { json: { name: 'Mom', partyName: '  Smith   Family Christmas ' } })).body;
+  assert.equal(named.name, 'Smith Family Christmas');
+  const { code, host, ava } = await party(call);
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.name, 'Mom’s party');
+  assert.deepEqual((await call('GET', `/api/parties/${code}/invite`)).body, { code, name: null, open: true }, 'host name stays private');
+  assert.deepEqual((await call('GET', `/api/parties/${named.code}/invite`)).body, { code: named.code, name: 'Smith Family Christmas', open: true });
+  assert.equal((await call('GET', '/api/parties/ZZZZZZ/invite')).status, 404);
+
+  assert.equal((await call('PATCH', `/api/parties/${code}`, { token: ava.token, json: { name: 'Mine now' } })).status, 403);
+  assert.equal((await call('PATCH', `/api/parties/${code}`, { token: host.token, json: { name: ' ' } })).status, 400);
+  assert.equal((await call('PATCH', `/api/parties/${code}`, { token: host.token, json: { name: 'x'.repeat(41) } })).status, 400);
+  const renamed = await call('PATCH', `/api/parties/${code}`, { token: host.token, json: { name: 'Work Holiday Party' } });
+  assert.equal(renamed.status, 200);
+  assert.equal(renamed.body.name, 'Work Holiday Party');
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.name, 'Work Holiday Party');
+  assert.equal((await call('POST', '/api/parties', { json: { name: 'Mom', partyName: '<b>' } })).status, 400);
+
+  await call('PUT', `/api/parties/${named.code}/photo`, { token: named.token, body: photoForm(await photo('red')) });
+  const guest = (await call('POST', `/api/parties/${named.code}/players`, { json: { name: 'Ava' } })).body;
+  await call('PUT', `/api/parties/${named.code}/photo`, { token: guest.token, body: photoForm(await photo('blue')) });
+  assert.equal((await call('POST', `/api/parties/${named.code}/start`, { token: named.token })).status, 200);
+  assert.deepEqual((await call('GET', `/api/parties/${named.code}/invite`)).body, { code: named.code, name: null, open: false });
 });

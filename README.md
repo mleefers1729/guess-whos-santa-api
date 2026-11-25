@@ -32,14 +32,19 @@ only its SHA-256 hash is stored.
 
 | Route | Who | Notes |
 | --- | --- | --- |
-| `POST /parties` `{name}` | anyone | Creates a party and host; returns `{code, playerId, token}` |
+| `POST /parties` `{name, partyName?}` | anyone | Creates a party and host; party name defaults to "<host>’s party" for members; returns `{code, name, playerId, token}` |
+| `GET /parties/:code/invite` | anyone with the code | `{code, name, open}` for the join screen; `name` is null unless the host set one and the lobby is open (never exposes the host's name) |
+| `PATCH /parties/:code` `{name}` | host | Renames the party (1-40 characters) |
 | `POST /parties/:code/players` `{name}` | anyone with the code | Lobby only; names unique per party (case-insensitive) |
 | `GET /parties/:code` | members | Party state; supports `If-None-Match` (304) for 3 s polling |
 | `PUT /parties/:code/photo` | members | Multipart `photo` + `x`, `y`, `zoom`; lobby only; replaces previous photo |
-| `DELETE /parties/:code/players/:id` | host | Lobby only; deletes their photos |
+| `POST /parties/:code/added-players` `{name}` | members | Lobby only; adds a phone-less player managed by the caller |
+| `DELETE /parties/:code/players/:id` | host, or the player's adder | Lobby only; deletes their photos and any players they added |
 | `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos |
-| `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked), no self-guess |
+| `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing yourself or your added players |
 | `POST /parties/:code/reveal` | host | Guessing → reveal |
+
+Photo and guess routes accept `?as=<playerId>` to act for a player you added.
 
 ### Photo privacy model
 

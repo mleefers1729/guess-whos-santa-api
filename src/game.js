@@ -32,6 +32,24 @@ function readName(body) {
   return name;
 }
 
+const PARTY_NAME_MAX = 40;
+const DEFAULT_PARTY_NAME = 'Santa party';
+function readPartyName(value, { optional = false } = {}) {
+  const name = typeof value === 'string' ? value.normalize('NFC').replace(/\s+/g, ' ').trim() : '';
+  if (!name && optional) return null;
+  if (name.length < 1 || name.length > PARTY_NAME_MAX || /[\p{Cc}<>]/u.test(name)) {
+    throw httpError(400, `Party name must be 1-${PARTY_NAME_MAX} characters`);
+  }
+  return name;
+}
+
+// Unnamed parties store null; members see "<host>’s party", but the public invite never shows the host's name.
+function defaultPartyName(hostName) {
+  if (!hostName) return DEFAULT_PARTY_NAME;
+  const full = `${hostName}’s party`;
+  return full.length <= PARTY_NAME_MAX ? full : DEFAULT_PARTY_NAME;
+}
+
 function readCode(value) {
   const code = String(value ?? '').toUpperCase();
   if (code.length !== CODE_LENGTH || [...code].some((c) => !CODE_ALPHABET.includes(c))) {
@@ -60,16 +78,24 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
   const rolls = Math.floor(now / URL_BUCKET_MS);
   const photoOwner = new Map(snapshot.photos.map((photo) => [photo.id, photo.player_id]));
   const santas = santaOrder(snapshot.photos);
-  const players = snapshot.players.map((player) => ({
-    id: player.id,
-    name: player.name,
-    isHost: player.is_host,
-    hasPhoto: snapshot.photos.some((photo) => photo.player_id === player.id),
-    guessCount: snapshot.guesses.filter((guess) => guess.guesser_id === player.id).length,
-  }));
+  // "Crew" = me plus the players I added; this device uploads and guesses for all of them.
+  const crew = new Set([me.id, ...snapshot.players.filter((p) => p.added_by === me.id).map((p) => p.id)]);
+  const players = snapshot.players.map((player) => {
+    const photo = snapshot.photos.find((item) => item.player_id === player.id);
+    return {
+      id: player.id,
+      name: player.name,
+      isHost: player.is_host,
+      addedBy: player.added_by,
+      hasPhoto: Boolean(photo),
+      guessCount: snapshot.guesses.filter((guess) => guess.guesser_id === player.id).length,
+      ...(crew.has(player.id) && { eyesUrl: photo ? storage.url(photo.eyes_key, expiresAt) : null }),
+    };
+  });
   const myPhoto = snapshot.photos.find((photo) => photo.player_id === me.id);
   const state = {
     code: party.code,
+    name: party.name ?? defaultPartyName(snapshot.players.find((player) => player.is_host)?.name),
     phase: party.phase,
     version: party.version,
     me: { id: me.id, name: me.name, isHost: me.is_host, hasPhoto: Boolean(myPhoto) },
@@ -85,6 +111,10 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
       eyesUrl: storage.url(photo.eyes_key, expiresAt),
       isMine: photo.player_id === me.id,
       myGuess: mine.get(photo.id) ?? null,
+      ownerId: crew.has(photo.player_id) ? photo.player_id : null,
+      guesses: Object.fromEntries(snapshot.guesses
+        .filter((g) => g.photo_id === photo.id && crew.has(g.guesser_id))
+        .map((g) => [g.guesser_id, g.guessed_player_id])),
     }));
   }
   if (party.phase === 'reveal') {
@@ -159,11 +189,12 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
 
   router.post('/parties', limiter(20), async (req, res) => {
     const host = newPlayer(readName(req.body), true);
+    const name = readPartyName(req.body?.partyName, { optional: true });
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const code = newCode();
       try {
-        await repository.createParty({ partyId: randomUUID(), code, host });
-        return res.status(201).json({ code, playerId: host.id, token: host.token });
+        await repository.createParty({ partyId: randomUUID(), code, name, host });
+        return res.status(201).json({ code, name: name ?? defaultPartyName(host.name), playerId: host.id, token: host.token });
       } catch (error) {
         if (!isUniqueViolation(error)) throw error;
       }
@@ -183,12 +214,54 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
       throw error;
     }
     if (result === 'closed') throw httpError(409, 'This party has already started');
-    res.status(201).json({ code: party.code, playerId: player.id, token: player.token });
+    res.status(201).json({ code: party.code, name: party.name, playerId: player.id, token: player.token });
   });
+
+  // Public preview for the join screen; anyone with the code can see the party name.
+  router.get('/parties/:code/invite', limiter(120), async (req, res) => {
+    const party = await repository.findParty(readCode(req.params.code));
+    if (!party) throw httpError(404, 'Party not found');
+    const open = party.phase === 'lobby';
+    res.json({ code: party.code, name: open ? party.name : null, open });
+  });
+
+  router.patch('/parties/:code', limiter(30), authenticate, hostOnly, async (req, res) => {
+    await repository.renameParty({ partyId: req.me.party_id, name: readPartyName(req.body?.name) });
+    await sendState(req, res);
+  });
+
+  // Lets a member act for a player they added: `?as=<playerId>`.
+  async function actor(req, _res, next) {
+    req.actor = req.me;
+    if (req.query.as !== undefined) {
+      const playerId = readId(req.query.as, 'Player not found');
+      if (playerId !== req.me.id) {
+        const added = await repository.findAddedPlayer({ partyId: req.me.party_id, addedBy: req.me.id, playerId });
+        if (!added) throw httpError(404, 'Player not found');
+        req.actor = added;
+      }
+    }
+    next();
+  }
 
   router.get('/parties/:code', authenticate, (req, res) => sendState(req, res));
 
-  router.put('/parties/:code/photo', limiter(30), authenticate, upload.single('photo'), async (req, res) => {
+  router.post('/parties/:code/added-players', limiter(60), authenticate, async (req, res) => {
+    const player = newPlayer(readName(req.body));
+    let result;
+    try {
+      result = await repository.addPlayer({ partyId: req.me.party_id, player, addedBy: req.me.id });
+    } catch (error) {
+      if (isUniqueViolation(error)) throw httpError(409, 'Someone at this party already has that name');
+      // The adder was removed while this request was in flight.
+      if (error?.code === '23503') throw httpError(401, 'Join this party to continue');
+      throw error;
+    }
+    if (result === 'closed') throw httpError(409, 'Players can only be added before guessing starts');
+    await sendState(req, res, 201);
+  });
+
+  router.put('/parties/:code/photo', limiter(30), authenticate, actor, upload.single('photo'), async (req, res) => {
     if (!req.file) throw httpError(400, 'A photo file is required');
     if (req.me.phase !== 'lobby') throw httpError(409, 'Photos are locked once guessing starts');
     let processed;
@@ -201,7 +274,7 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     const photo = { id: randomUUID() };
     Object.assign(photo, photoKeys(req.me.party_id, photo.id));
     await Promise.all([storage.put(photo.eyesKey, processed.eyes), storage.put(photo.faceKey, processed.face)]);
-    const result = await repository.savePhoto({ partyId: req.me.party_id, playerId: req.me.id, photo });
+    const result = await repository.savePhoto({ partyId: req.me.party_id, playerId: req.actor.id, photo });
     if (result.status === 'closed') {
       await storage.remove([photo.eyesKey, photo.faceKey]);
       throw httpError(409, 'Photos are locked once guessing starts');
@@ -212,14 +285,16 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     await sendState(req, res, 201);
   });
 
-  router.delete('/parties/:code/players/:playerId', authenticate, hostOnly, async (req, res) => {
-    const result = await repository.removePlayer({ partyId: req.me.party_id, playerId: readId(req.params.playerId, 'Player not found') });
+  router.delete('/parties/:code/players/:playerId', authenticate, async (req, res) => {
+    const result = await repository.removePlayer({
+      partyId: req.me.party_id, playerId: readId(req.params.playerId, 'Player not found'), requester: req.me,
+    });
     if (result.status === 'closed') throw httpError(409, 'Players can only be removed before guessing starts');
     if (result.status === 'missing') throw httpError(404, 'Player not found');
     if (result.status === 'host') throw httpError(400, 'The host cannot be removed');
-    if (result.photo) {
-      await storage.remove([result.photo.eyes_key, result.photo.face_key]).catch(console.error);
-    }
+    if (result.status === 'forbidden') throw httpError(403, 'Only the host can remove that player');
+    const keys = result.photos.flatMap((photo) => [photo.eyes_key, photo.face_key]);
+    if (keys.length) await storage.remove(keys).catch(console.error);
     await sendState(req, res);
   });
 
@@ -232,16 +307,17 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     await sendState(req, res);
   });
 
-  router.put('/parties/:code/guesses/:photoId', authenticate, async (req, res) => {
+  router.put('/parties/:code/guesses/:photoId', authenticate, actor, async (req, res) => {
     const guessedPlayerId = readId(req.body?.playerId, 'Pick someone else in this party');
     const result = await repository.addGuess({
-      partyId: req.me.party_id, guesserId: req.me.id,
+      partyId: req.me.party_id, guesserId: req.actor.id,
       photoId: readId(req.params.photoId, 'Santa not found'), guessedPlayerId,
     });
     const errors = {
       closed: [409, 'Guessing is not open'],
       'missing-photo': [404, 'Santa not found'],
       'own-photo': [400, "That's you! Guess the other Santas"],
+      'crew-photo': [400, 'You added that Santa! Guess the others'],
       'invalid-suspect': [400, 'Pick someone else in this party'],
       duplicate: [409, 'You already guessed this Santa'],
     };

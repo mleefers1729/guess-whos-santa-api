@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS parties (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS parties_created_at_idx ON parties (created_at);
+ALTER TABLE parties ADD COLUMN IF NOT EXISTS name text;
 CREATE TABLE IF NOT EXISTS players (
   id uuid PRIMARY KEY,
   party_id uuid NOT NULL REFERENCES parties (id) ON DELETE CASCADE,
@@ -17,6 +18,9 @@ CREATE TABLE IF NOT EXISTS players (
   is_host boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+-- Players added by another member (kids, anyone without a phone); that member acts for them.
+ALTER TABLE players ADD COLUMN IF NOT EXISTS added_by uuid REFERENCES players (id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS players_added_by_idx ON players (added_by);
 CREATE UNIQUE INDEX IF NOT EXISTS players_party_name_idx ON players (party_id, lower(name));
 CREATE TABLE IF NOT EXISTS photos (
   id uuid PRIMARY KEY,
@@ -65,9 +69,9 @@ export async function transaction(pool, work) {
 
 export function createRepository(pool, { retentionDays = 30 } = {}) {
   return {
-    async createParty({ partyId, code, host }) {
+    async createParty({ partyId, code, name, host }) {
       return transaction(pool, async (client) => {
-        await client.query('INSERT INTO parties (id, code) VALUES ($1, $2)', [partyId, code]);
+        await client.query('INSERT INTO parties (id, code, name) VALUES ($1, $2, $3)', [partyId, code, name]);
         await client.query(
           'INSERT INTO players (id, party_id, name, token_hash, is_host) VALUES ($1, $2, $3, $4, true)',
           [host.id, partyId, host.name, host.tokenHash],
@@ -86,19 +90,23 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async findParty(code) {
       const { rows } = await pool.query(`
-        SELECT id, code, phase, version FROM parties
+        SELECT id, code, name, phase, version FROM parties
         WHERE code = $1 AND created_at > now() - make_interval(days => $2)`, [code, retentionDays]);
       return rows[0];
     },
 
-    async addPlayer({ partyId, player }) {
+    async renameParty({ partyId, name }) {
+      await pool.query('UPDATE parties SET name = $2, version = version + 1 WHERE id = $1', [partyId, name]);
+    },
+
+    async addPlayer({ partyId, player, addedBy = null }) {
       return transaction(pool, async (client) => {
         const { rows } = await client.query(
           "SELECT phase FROM parties WHERE id = $1 FOR UPDATE", [partyId]);
         if (rows[0]?.phase !== 'lobby') return 'closed';
         await client.query(
-          'INSERT INTO players (id, party_id, name, token_hash) VALUES ($1, $2, $3, $4)',
-          [player.id, partyId, player.name, player.tokenHash],
+          'INSERT INTO players (id, party_id, name, token_hash, added_by) VALUES ($1, $2, $3, $4, $5)',
+          [player.id, partyId, player.name, player.tokenHash, addedBy],
         );
         await bump(client, partyId);
         return 'joined';
@@ -107,7 +115,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async snapshot(partyId) {
       const [players, photos, guesses] = await Promise.all([
-        pool.query('SELECT id, name, is_host FROM players WHERE party_id = $1 ORDER BY created_at, id', [partyId]),
+        pool.query('SELECT id, name, is_host, added_by FROM players WHERE party_id = $1 ORDER BY created_at, id', [partyId]),
         pool.query('SELECT id, player_id, eyes_key, face_key FROM photos WHERE party_id = $1 ORDER BY id', [partyId]),
         pool.query(`
           SELECT g.guesser_id, g.photo_id, g.guessed_player_id
@@ -115,6 +123,13 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
           WHERE ph.party_id = $1`, [partyId]),
       ]);
       return { players: players.rows, photos: photos.rows, guesses: guesses.rows };
+    },
+
+    async findAddedPlayer({ partyId, addedBy, playerId }) {
+      const { rows } = await pool.query(
+        'SELECT id, name, is_host FROM players WHERE id = $1 AND party_id = $2 AND added_by = $3',
+        [playerId, partyId, addedBy]);
+      return rows[0];
     },
 
     async lockLobby(client, partyId) {
@@ -137,18 +152,22 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       });
     },
 
-    async removePlayer({ partyId, playerId }) {
+    // The host can remove anyone else; members can remove players they added.
+    // Removing a member also removes the players they added (and their photos).
+    async removePlayer({ partyId, playerId, requester }) {
       return transaction(pool, async (client) => {
         if (!(await this.lockLobby(client, partyId))) return { status: 'closed' };
-        const { rows } = await client.query(`
-          SELECT pl.is_host, ph.eyes_key, ph.face_key FROM players pl
-          LEFT JOIN photos ph ON ph.player_id = pl.id
-          WHERE pl.id = $1 AND pl.party_id = $2`, [playerId, partyId]);
+        const { rows } = await client.query(
+          'SELECT is_host, added_by FROM players WHERE id = $1 AND party_id = $2', [playerId, partyId]);
         if (!rows[0]) return { status: 'missing' };
         if (rows[0].is_host) return { status: 'host' };
+        if (!requester.is_host && rows[0].added_by !== requester.id) return { status: 'forbidden' };
+        const photos = await client.query(`
+          SELECT ph.eyes_key, ph.face_key FROM photos ph JOIN players pl ON pl.id = ph.player_id
+          WHERE pl.id = $1 OR pl.added_by = $1`, [playerId]);
         await client.query('DELETE FROM players WHERE id = $1', [playerId]);
         await bump(client, partyId);
-        return { status: 'removed', photo: rows[0].eyes_key ? rows[0] : undefined };
+        return { status: 'removed', photos: photos.rows };
       });
     },
 
@@ -167,10 +186,14 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       return transaction(pool, async (client) => {
         const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR SHARE', [partyId]);
         if (rows[0]?.phase !== 'guessing') return 'closed';
-        const photo = await client.query(
-          'SELECT player_id FROM photos WHERE id = $1 AND party_id = $2', [photoId, partyId]);
+        // A crew is a member plus the players they added; nobody guesses their own crew's Santas.
+        const photo = await client.query(`
+          SELECT pl.id, coalesce(pl.added_by, pl.id) AS crew FROM photos ph JOIN players pl ON pl.id = ph.player_id
+          WHERE ph.id = $1 AND ph.party_id = $2`, [photoId, partyId]);
         if (!photo.rows[0]) return 'missing-photo';
-        if (photo.rows[0].player_id === guesserId) return 'own-photo';
+        if (photo.rows[0].id === guesserId) return 'own-photo';
+        const guesser = await client.query('SELECT coalesce(added_by, id) AS crew FROM players WHERE id = $1', [guesserId]);
+        if (guesser.rows[0]?.crew === photo.rows[0].crew) return 'crew-photo';
         const suspect = await client.query(`
           SELECT 1 FROM players pl JOIN photos ph ON ph.player_id = pl.id
           WHERE pl.id = $1 AND pl.party_id = $2 AND pl.id <> $3`, [guessedPlayerId, partyId, guesserId]);
