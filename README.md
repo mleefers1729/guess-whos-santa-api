@@ -180,4 +180,14 @@ Host transfer if the host leaves, removing players after guessing starts,
 pagination for very large parties, and per-party rate limits shared across
 tasks (current limits are per task, per IP).
 
-See the sibling [AWS project](../guess-whos-santa-infra/README.md) for deployment.
+Infrastructure is versioned in [infra/](infra/README.md). After the one-time
+GitHub OIDC setup, successful pushes to `main` deploy this API and infrastructure
+with CDK; pull requests run checks only. The workflow uses the existing stack
+and ARM64 image target rather than updating ECS outside CloudFormation.
+GitHub Actions uses short-lived OIDC credentials, not long-lived AWS keys;
+optional override variables are listed in the infrastructure README. For local infrastructure validation:
+
+```sh
+npm ci --prefix infra
+npm --prefix infra test
+```

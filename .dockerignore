@@ -6,4 +6,5 @@ node_modules
 uploads
 test
 coverage
+infra
 *.log
