@@ -423,8 +423,7 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
 
   router.post('/parties/:code/reopen-submissions', authenticate, hostOnly, async (req, res) => {
     const result = await repository.reopenSubmissions(req.me.party_id);
-    if (result === 'started') throw httpError(409, 'Submissions cannot reopen after anyone has guessed or revealed the Santas');
-    if (result !== 'reopened') throw httpError(409, 'Submissions can only reopen during guessing');
+    if (result !== 'reopened') throw httpError(409, 'Submissions are already open');
     await sendState(req, res);
   });
 

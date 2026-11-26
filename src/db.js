@@ -323,11 +323,10 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
     async reopenSubmissions(partyId) {
       return transaction(pool, async (client) => {
         const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
-        if (rows[0]?.phase !== 'guessing') return 'wrong-phase';
-        const activity = await client.query(`
-          SELECT EXISTS (SELECT 1 FROM guesses g JOIN players pl ON pl.id = g.guesser_id WHERE pl.party_id = $1)
-            OR EXISTS (SELECT 1 FROM players WHERE party_id = $1 AND revealed_at IS NOT NULL) AS started`, [partyId]);
-        if (activity.rows[0].started) return 'started';
+        if (!['guessing', 'reveal'].includes(rows[0]?.phase)) return 'wrong-phase';
+        await client.query(`
+          DELETE FROM guesses WHERE guesser_id IN (SELECT id FROM players WHERE party_id = $1)`, [partyId]);
+        await client.query('UPDATE players SET revealed_at = NULL WHERE party_id = $1 AND revealed_at IS NOT NULL', [partyId]);
         await client.query(`
           DELETE FROM guess_notifications WHERE player_id IN (SELECT id FROM players WHERE party_id = $1)`, [partyId]);
         await client.query("UPDATE parties SET phase = 'lobby', version = version + 1 WHERE id = $1", [partyId]);

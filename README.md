@@ -103,7 +103,7 @@ before hashing and are never logged or returned by the API.
 | `DELETE /parties/:code/players/:id` | host, or the player's adder | Lobby only; deletes their photos and any players they added |
 | `PUT /parties/:code/notification-email` `{email}` | member | Changes that member's notification address; revokes previous notification links. If called using a notification link, returns `replacementToken` for the current browser |
 | `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos; queues notifications transactionally |
-| `POST /parties/:code/reopen-submissions` | host | Guessing → lobby only before anyone has guessed or revealed; cancels queued guessing notifications |
+| `POST /parties/:code/reopen-submissions` | host | Guessing or reveal → lobby; resets all guesses and reveals and cancels queued guessing notifications |
 | `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing your own photo or after your reveal |
 | `POST /parties/:code/reveal` | members | Reveals and locks guesses for this player; party enters reveal phase after all players reveal |
 

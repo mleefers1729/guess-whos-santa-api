@@ -360,7 +360,7 @@ test('guessing notifications retry and provide private party-scoped access', { s
   assert.equal((await call('GET', `/api/parties/${code}`, { token: hostToken })).status, 401);
 });
 
-test('only the host can reopen submissions before activity and restart notifications safely', { skip }, async (t) => {
+test('only the host can reopen submissions and restart notifications safely', { skip }, async (t) => {
   const { call, createHost } = await serve(t);
   const { code, host, ava } = await party(call, createHost);
   t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
@@ -401,14 +401,19 @@ test('only the host can reopen submissions before activity and restart notificat
   assert.equal((await call('PUT', `/api/parties/${code}/guesses/${target.id}`, {
     token: ava.token, json: { playerId: host.playerId },
   })).status, 200);
-  const blocked = await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token });
-  assert.equal(blocked.status, 409);
-  assert.match(blocked.body.error, /guessed or revealed/);
+  const reset = await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token });
+  assert.equal(reset.status, 200);
+  assert.equal(reset.body.phase, 'lobby');
+  assert.ok(reset.body.players.every((player) => player.guessCount === 0 && !player.revealed));
+  assert.equal((await call('PUT', `/api/parties/${code}/photo`, { token: ava.token, body: photoForm(image) })).status, 201);
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  const replay = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  assert.ok(replay.santas.every((santa) => !santa.myGuess), 'restarted guessing has no old guesses');
 });
 
-test('reopening is blocked after a managed player reveals without guessing', { skip }, async (t) => {
+test('reopening a fully revealed party resets guesses and managed-player reveals', { skip }, async (t) => {
   const { call, createHost } = await serve(t);
-  const { code, host, ava } = await party(call, createHost);
+  const { code, host, ava, ben } = await party(call, createHost);
   t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
   const image = await photo('green');
   for (const player of [host, ava]) await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) });
@@ -419,12 +424,28 @@ test('reopening is blocked after a managed player reveals without guessing', { s
   const revealed = await call('POST', `/api/parties/${code}/reveal?as=${child.id}`, { token: host.token });
   assert.equal(revealed.status, 200);
   assert.equal(revealed.body.players.find((player) => player.id === child.id).guessCount, 0);
-  const blocked = await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token });
-  assert.equal(blocked.status, 409);
-  assert.match(blocked.body.error, /guessed or revealed/);
+  const view = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  const target = view.santas.find((santa) => !santa.isMine);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${target.id}`, {
+    token: ava.token, json: { playerId: host.playerId },
+  })).status, 200);
+  for (const player of [host, ava, ben]) {
+    const result = await call('POST', `/api/parties/${code}/reveal`, { token: player.token });
+    assert.equal(result.status, 200);
+  }
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: host.token })).body.phase, 'reveal');
+  const reopened = await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token });
+  assert.equal(reopened.status, 200);
+  assert.equal(reopened.body.phase, 'lobby');
+  assert.ok(reopened.body.players.every((player) => !player.revealed && player.guessCount === 0));
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  const replay = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.equal(replay.views[child.id].revealed, false);
+  assert.ok(replay.views[child.id].santas.every((santa) => !santa.faceUrl && !santa.playerId));
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.santas.find((santa) => santa.id === target.id).myGuess, null);
 });
 
-test('a concurrent guess and reopen cannot both succeed', { skip }, async (t) => {
+test('a concurrent guess cannot survive reopening submissions', { skip }, async (t) => {
   const { call, createHost } = await serve(t);
   const { code, host, ava } = await party(call, createHost);
   t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
@@ -437,10 +458,11 @@ test('a concurrent guess and reopen cannot both succeed', { skip }, async (t) =>
     call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token }),
     call('PUT', `/api/parties/${code}/guesses/${target.id}`, { token: ava.token, json: { playerId: host.playerId } }),
   ]);
-  assert.deepEqual([reopen.status, guess.status].sort(), [200, 409]);
+  assert.equal(reopen.status, 200);
+  assert.ok([200, 409].includes(guess.status));
   const state = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
-  assert.equal(state.phase, reopen.status === 200 ? 'lobby' : 'guessing');
-  assert.equal(state.players.find((player) => player.id === ava.playerId).guessCount, guess.status === 200 ? 1 : 0);
+  assert.equal(state.phase, 'lobby');
+  assert.equal(state.players.find((player) => player.id === ava.playerId).guessCount, 0);
 });
 
 test('reopening and finishing an in-flight guessing email do not deadlock', { skip }, async (t) => {
