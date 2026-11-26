@@ -303,6 +303,17 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     await sendState(req, res);
   });
 
+  router.post('/parties/:code/submission-notifications/seen', authenticate, hostOnly, async (req, res) => {
+    const ids = req.body?.playerIds;
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 100) {
+      throw httpError(400, 'Select 1-100 submission updates');
+    }
+    const playerIds = ids.map((id) => readId(id, 'Submission update not found'));
+    const result = await repository.markSubmissionsSeen({ partyId: req.me.party_id, playerIds });
+    if (result !== 'seen') throw httpError(404, 'Submission update not found');
+    await sendState(req, res);
+  });
+
   // Lets a member act for a player they added: `?as=<playerId>`.
   async function actor(req, _res, next) {
     req.actor = req.me;

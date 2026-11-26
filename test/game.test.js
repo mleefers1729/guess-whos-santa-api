@@ -265,6 +265,45 @@ test('new Santa submissions notify the host, persist, and retry after guessing s
   assert.ok(final.submissions.every((entry) => entry.emailStatus === 'sent'));
 });
 
+test('seen submission updates stay hidden across host sessions without cancelling emails', { skip }, async (t) => {
+  const { call, createHost, signIn } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const image = await photo('red');
+  const upload = (player) => call('PUT', `/api/parties/${code}/photo`, {
+    token: player.token, body: photoForm(image),
+  });
+  assert.equal((await upload(ava)).status, 201);
+  const path = `/api/parties/${code}/submission-notifications/seen`;
+  const json = { playerIds: [ava.playerId] };
+  assert.equal((await call('POST', path, { token: ava.token, json })).status, 403);
+  assert.equal((await call('POST', path, { token: host.token, json: { playerIds: [] } })).status, 400);
+  assert.equal((await call('POST', path, {
+    token: host.token, json: { playerIds: [ava.playerId, randomUUID()] },
+  })).status, 404);
+  const before = await call('GET', `/api/parties/${code}`, { token: host.token });
+  assert.equal(before.body.submissions.length, 1, 'invalid batches do not mark any update seen');
+  const seen = await call('POST', path, { token: host.token, json });
+  assert.equal(seen.status, 200);
+  assert.deepEqual(seen.body.submissions, []);
+  assert.notEqual(seen.headers.get('etag'), before.headers.get('etag'));
+  const repeated = await call('POST', path, { token: host.token, json });
+  assert.equal(repeated.status, 200);
+  assert.equal(repeated.body.version, seen.body.version, 'repeated acknowledgements are idempotent');
+  const email = (await call('GET', '/api/auth/session', { token: host.token })).body.user.email;
+  await pool.query("UPDATE login_codes SET sent_at = now() - interval '2 minutes' WHERE email = $1", [email]);
+  const otherDevice = await signIn(email);
+  assert.deepEqual((await call('GET', `/api/parties/${code}`, { cookie: otherDevice.cookie })).body.submissions, []);
+  assert.equal((await upload(ava)).status, 201);
+  assert.equal((await upload(ben)).status, 201);
+  const current = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.deepEqual(current.submissions.map((entry) => entry.playerId), [ben.playerId],
+    'photo replacements stay hidden but new submissions appear');
+  const repository = createRepository(pool);
+  const claim = await repository.claimSubmissionNotification({ tokenHash: randomBytes(32), leaseId: randomUUID() });
+  assert.equal(claim.player_name, 'Ava', 'seen in-app updates still queue host emails');
+});
+
 test('guessing notifications retry and provide private party-scoped access', { skip }, async (t) => {
   const { call, createHost, signIn } = await serve(t);
   const { code, host, ava, ben } = await party(call, createHost);

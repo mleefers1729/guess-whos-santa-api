@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS notification_links (
   token_hash bytea PRIMARY KEY,
   player_id uuid NOT NULL REFERENCES players (id) ON DELETE CASCADE
 );
+ALTER TABLE submission_notifications ADD COLUMN IF NOT EXISTS seen_at timestamptz;
 CREATE INDEX IF NOT EXISTS notification_links_player_idx ON notification_links (player_id);
 CREATE TABLE IF NOT EXISTS monitor_totals (
   id boolean PRIMARY KEY DEFAULT true CHECK (id),
@@ -228,9 +229,24 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
         pool.query(`
           SELECT n.player_id, pl.name, n.created_at, n.status, n.attempts
           FROM submission_notifications n JOIN players pl ON pl.id = n.player_id
-          WHERE pl.party_id = $1 ORDER BY n.created_at DESC, n.player_id`, [partyId]),
+          WHERE pl.party_id = $1 AND n.seen_at IS NULL ORDER BY n.created_at DESC, n.player_id`, [partyId]),
       ]);
       return { players: players.rows, photos: photos.rows, guesses: guesses.rows, submissions: submissions.rows };
+    },
+
+    async markSubmissionsSeen({ partyId, playerIds }) {
+      return transaction(pool, async (client) => {
+        await client.query('SELECT id FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
+        const existing = await client.query(`
+          SELECT n.player_id FROM submission_notifications n JOIN players pl ON pl.id = n.player_id
+          WHERE pl.party_id = $1 AND n.player_id = ANY($2::uuid[])`, [partyId, playerIds]);
+        if (existing.rowCount !== new Set(playerIds).size) return 'missing';
+        const updated = await client.query(`
+          UPDATE submission_notifications SET seen_at = now()
+          WHERE player_id = ANY($1::uuid[]) AND seen_at IS NULL`, [playerIds]);
+        if (updated.rowCount) await bump(client, partyId);
+        return 'seen';
+      });
     },
 
     async findAddedPlayer({ partyId, addedBy, playerId }) {

@@ -96,6 +96,7 @@ before hashing and are never logged or returned by the API.
 | `PATCH /parties/:code` `{name}` | host | Renames the party (1-40 characters) |
 | `POST /parties/:code/players` `{name, email}` | anyone with the code | Lobby only; email required for guests, signed-in accounts use their email; names unique per party (case-insensitive) |
 | `GET /parties/:code` | members | Party state; supports `If-None-Match` (304) for 3 s polling |
+| `POST /parties/:code/submission-notifications/seen` `{playerIds}` | host | Marks 1-100 submission updates seen; hides them across devices without affecting email delivery; repeated acknowledgements are safe |
 | `GET /parties/:code/notification-access` | notification link bearer | Validates that link specifically and returns its member's party state, regardless of any account cookie |
 | `PUT /parties/:code/media-consent` `{kind, granted}` | members | Lobby only; `kind` is `camera` or `photos`, `granted` is a boolean |
 | `PUT /parties/:code/photo` | members | Multipart `photo` + `x`, `y`, `zoom`, `source` (`camera` or `photos`), `shareConsent` (`true`); requires saved source consent; lobby only; replaces previous photo |
