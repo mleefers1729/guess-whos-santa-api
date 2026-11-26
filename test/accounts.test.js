@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createSendGridMailer } from '../src/accounts.js';
-import { createGuessMailer } from '../src/notifications.js';
+import { createGuessMailer, createSubmissionMailer } from '../src/notifications.js';
 
 test('SendGrid sends the browser-bound code using the authenticated sender', async (t) => {
   const request = t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 202 }));
@@ -65,4 +65,21 @@ test('guessing emails contain private links without click tracking', async (t) =
   assert.deepEqual(body.tracking_settings.click_tracking, { enable: false, enable_text: false });
   assert.ok(body.content.every((part) => part.value.includes(link)));
   assert.match(body.content[0].value, /don't share/);
+});
+
+test('submission emails identify the player safely and include a private link', async (t) => {
+  const request = t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 202 }));
+  const send = createSubmissionMailer({ apiKey: 'test-key', sender: 'signin@example.com' });
+  const link = `https://example.com/p/ABCDEF#access=${'a'.repeat(43)}`;
+  await send({ email: 'host@example.com', link, playerName: "A & B's" });
+  const body = JSON.parse(request.mock.calls[0].arguments[1].body);
+  assert.deepEqual(body.personalizations, [{ to: [{ email: 'host@example.com' }] }]);
+  assert.deepEqual(body.tracking_settings.click_tracking, { enable: false, enable_text: false });
+  assert.ok(body.content.every((part) => part.value.includes(link)));
+  assert.match(body.content[0].value, /A & B's submitted/);
+  assert.match(body.content[1].value, /A &amp; B&#39;s submitted/);
+  assert.match(body.content[0].value, /don't share/);
+  assert.equal(createSubmissionMailer({ sender: 'signin@example.com' }), undefined);
+  request.mock.mockImplementation(async () => new Response(null, { status: 503 }));
+  await assert.rejects(send({ email: 'host@example.com', link, playerName: 'Alex' }), { name: 'SendGridDeliveryError', status: 503 });
 });

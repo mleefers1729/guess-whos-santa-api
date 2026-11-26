@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS guess_notifications (
   lease_until timestamptz,
   lease_id uuid
 );
+CREATE TABLE IF NOT EXISTS submission_notifications (
+  player_id uuid PRIMARY KEY REFERENCES players (id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent')),
+  attempts integer NOT NULL DEFAULT 0,
+  next_attempt timestamptz NOT NULL DEFAULT now(),
+  lease_until timestamptz,
+  lease_id uuid
+);
 CREATE TABLE IF NOT EXISTS notification_links (
   token_hash bytea PRIMARY KEY,
   player_id uuid NOT NULL REFERENCES players (id) ON DELETE CASCADE
@@ -204,7 +213,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
     },
 
     async snapshot(partyId) {
-      const [players, photos, guesses] = await Promise.all([
+      const [players, photos, guesses, submissions] = await Promise.all([
         pool.query(`SELECT pl.id, pl.name, pl.is_host, pl.added_by, pl.media_consent, pl.revealed_at,
           coalesce(pl.notification_email, a.email) AS notification_email, n.status AS notification_status,
           n.attempts AS notification_attempts
@@ -216,8 +225,12 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
           SELECT g.guesser_id, g.photo_id, g.guessed_player_id, g.created_at
           FROM guesses g JOIN photos ph ON ph.id = g.photo_id
           WHERE ph.party_id = $1`, [partyId]),
+        pool.query(`
+          SELECT n.player_id, pl.name, n.created_at, n.status, n.attempts
+          FROM submission_notifications n JOIN players pl ON pl.id = n.player_id
+          WHERE pl.party_id = $1 ORDER BY n.created_at DESC, n.player_id`, [partyId]),
       ]);
-      return { players: players.rows, photos: photos.rows, guesses: guesses.rows };
+      return { players: players.rows, photos: photos.rows, guesses: guesses.rows, submissions: submissions.rows };
     },
 
     async findAddedPlayer({ partyId, addedBy, playerId }) {
@@ -248,7 +261,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
     async savePhoto({ partyId, playerId, photo, source, recordedBy }) {
       return transaction(pool, async (client) => {
         if (!(await this.lockLobby(client, partyId))) return { status: 'closed' };
-        const consent = await client.query('SELECT media_consent FROM players WHERE id = $1 AND party_id = $2', [playerId, partyId]);
+        const consent = await client.query('SELECT media_consent, is_host FROM players WHERE id = $1 AND party_id = $2', [playerId, partyId]);
         if (!consent.rows[0]?.media_consent[source]?.granted) return { status: 'consent-required' };
         const { rows } = await client.query(
           'SELECT eyes_key, face_key FROM photos WHERE player_id = $1', [playerId]);
@@ -261,6 +274,9 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
           UPDATE players SET media_consent = media_consent || jsonb_build_object('sharing',
             jsonb_build_object('granted', true, 'recordedAt', now(), 'recordedBy', $2::text, 'version', 1))
           WHERE id = $1`, [playerId, recordedBy]);
+        if (!rows[0] && !consent.rows[0].is_host) {
+          await client.query('INSERT INTO submission_notifications (player_id) VALUES ($1) ON CONFLICT DO NOTHING', [playerId]);
+        }
         await bump(client, partyId);
         return { status: 'saved', replaced: rows[0] };
       });
@@ -369,6 +385,41 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       return transaction(pool, async (client) => {
         const { rowCount } = await client.query(`
           UPDATE guess_notifications SET status = $3, lease_id = NULL, lease_until = NULL,
+            next_attempt = now() + make_interval(secs => least(900, 15 * power(2, least(attempts, 6))::int))
+          WHERE player_id = $1 AND lease_id = $2`,
+        [playerId, leaseId, sent ? 'sent' : 'pending']);
+        if (rowCount) await bump(client, partyId);
+      });
+    },
+
+    async claimSubmissionNotification({ tokenHash, leaseId }) {
+      return transaction(pool, async (client) => {
+        const { rows } = await client.query(`
+          SELECT n.player_id, submitter.name AS player_name, pa.id AS party_id, pa.code,
+            coalesce(host.notification_email, a.email) AS email, host.id AS host_id
+          FROM submission_notifications n JOIN players submitter ON submitter.id = n.player_id
+          JOIN parties pa ON pa.id = submitter.party_id
+          JOIN players host ON host.party_id = pa.id AND host.is_host
+          LEFT JOIN accounts a ON a.id = host.account_id
+          WHERE pa.created_at > now() - make_interval(days => $1)
+            AND coalesce(host.notification_email, a.email) IS NOT NULL
+            AND ((n.status = 'pending' AND n.next_attempt <= now())
+              OR (n.status = 'sending' AND n.lease_until < now()))
+          ORDER BY n.next_attempt FOR UPDATE OF n SKIP LOCKED LIMIT 1`, [retentionDays]);
+        const item = rows[0];
+        if (!item) return null;
+        await client.query(`
+          UPDATE submission_notifications SET status = 'sending', attempts = attempts + 1,
+            lease_id = $2, lease_until = now() + interval '2 minutes' WHERE player_id = $1`, [item.player_id, leaseId]);
+        await client.query('INSERT INTO notification_links (token_hash, player_id) VALUES ($1, $2)', [tokenHash, item.host_id]);
+        return item;
+      });
+    },
+
+    async finishSubmissionNotification({ playerId, partyId, leaseId, sent }) {
+      return transaction(pool, async (client) => {
+        const { rowCount } = await client.query(`
+          UPDATE submission_notifications SET status = $3, lease_id = NULL, lease_until = NULL,
             next_attempt = now() + make_interval(secs => least(900, 15 * power(2, least(attempts, 6))::int))
           WHERE player_id = $1 AND lease_id = $2`,
         [playerId, leaseId, sent ? 'sent' : 'pending']);

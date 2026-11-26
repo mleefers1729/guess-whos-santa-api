@@ -162,6 +162,13 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
     },
     players,
     myEyesUrl: myPhoto ? storage.url(myPhoto.eyes_key, expiresAt) : null,
+    ...(me.is_host && {
+      submissions: (snapshot.submissions ?? []).map((submission) => ({
+        playerId: submission.player_id, name: submission.name, createdAt: submission.created_at,
+        emailStatus: submission.status === 'sent' ? 'sent'
+          : submission.status === 'sending' ? 'sending' : submission.attempts > 0 ? 'retrying' : 'pending',
+      })),
+    }),
   };
   if (party.phase !== 'lobby') {
     const scores = new Map(snapshot.players.map((player) => [player.id, 0]));

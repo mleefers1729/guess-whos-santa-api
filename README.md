@@ -122,6 +122,16 @@ until the party is in the reveal phase.
 
 ### Guessing notifications
 
+Each non-host player's first photo submission also queues an email to the
+host's notification address and appears in the host-only `submissions` party
+state, including delivery status. This includes players managed by the host;
+replacing a photo and the host's own photo do not queue updates. The email has
+a private host party link with the same access and expiry rules as guessing
+links. Failed deliveries are retried, including after guessing starts; if the
+host has no notification address, delivery waits until one is added. Updates
+are removed with the submitting player or expired party. Existing photos are
+not backfilled when this feature is deployed.
+
 Starting guessing queues one email per direct member with an address. Managed
 players are covered by the member who added them. Existing guests without an
 address are shown a form and the host sees a warning; starting is not blocked.

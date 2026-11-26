@@ -205,6 +205,66 @@ test('badges handle tied or insufficient results without inventing awards', () =
     'equal speeds and no incorrect guesses do not produce speed or disguise badges');
 });
 
+test('new Santa submissions notify the host, persist, and retry after guessing starts', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const hostEmail = (await call('GET', '/api/auth/session', { token: host.token })).body.user.email;
+  const child = (await call('POST', `/api/parties/${code}/added-players`, {
+    token: host.token, json: { name: 'Child' },
+  })).body.players.find((player) => player.name === 'Child');
+  await allowPhotos(call, code, host.token, child.id);
+  const upload = (token, as) => call('PUT', `/api/parties/${code}/photo${as ? `?as=${as}` : ''}`, {
+    token, body: photoForm(image),
+  });
+  const image = await photo('red');
+  assert.equal((await upload(host.token)).status, 201);
+  assert.deepEqual((await call('GET', `/api/parties/${code}`, { token: host.token })).body.submissions, []);
+  assert.equal((await upload(ava.token)).status, 201);
+  assert.equal((await upload(ava.token)).status, 201, 'replacing a photo is not a new submission');
+  assert.equal((await upload(host.token, child.id)).status, 201);
+  const lobby = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.deepEqual(new Set(lobby.submissions.map((entry) => entry.name)), new Set(['Ava', 'Child']));
+  assert.ok(lobby.submissions.every((entry) => entry.emailStatus === 'pending'));
+  assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.submissions, undefined);
+
+  const { rows: [hostRow] } = await pool.query('SELECT account_id FROM players WHERE id = $1', [host.playerId]);
+  await pool.query('UPDATE players SET account_id = NULL WHERE id = $1', [host.playerId]);
+  const repository = createRepository(pool);
+  assert.equal(await repository.claimSubmissionNotification({ tokenHash: randomBytes(32), leaseId: randomUUID() }), null,
+    'submissions wait when the host has no email address');
+  await pool.query('UPDATE players SET account_id = $2 WHERE id = $1', [host.playerId, hostRow.account_id]);
+
+  const messages = [];
+  let failAva = true;
+  const worker = createNotificationWorker({
+    repository, clientOrigin: 'https://example.com',
+    sendGuessEmail: async () => {},
+    sendSubmissionEmail: async (message) => {
+      if (message.playerName === 'Ava' && failAva) throw new Error('test failure');
+      messages.push(message);
+    },
+  });
+  await worker.run();
+  const pending = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.equal(pending.submissions.find((entry) => entry.name === 'Ava').emailStatus, 'retrying');
+  assert.equal(pending.submissions.find((entry) => entry.name === 'Child').emailStatus, 'sent');
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].email, hostEmail);
+  const link = new URL(messages[0].link);
+  const token = new URLSearchParams(link.hash.slice(1)).get('access');
+  assert.equal(link.pathname, `/p/${code}`);
+  assert.equal((await call('GET', `/api/parties/${code}/notification-access`, { token })).body.me.id, host.playerId);
+  assert.equal((await call('POST', `/api/parties/${code}/start`, { token: host.token })).status, 200);
+  failAva = false;
+  await pool.query("UPDATE submission_notifications SET next_attempt = now() WHERE player_id = $1", [ava.playerId]);
+  await worker.run();
+  await worker.run();
+  assert.deepEqual(messages.map((message) => message.playerName).sort(), ['Ava', 'Child']);
+  const final = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.ok(final.submissions.every((entry) => entry.emailStatus === 'sent'));
+});
+
 test('guessing notifications retry and provide private party-scoped access', { skip }, async (t) => {
   const { call, createHost, signIn } = await serve(t);
   const { code, host, ava, ben } = await party(call, createHost);
@@ -238,6 +298,7 @@ test('guessing notifications retry and provide private party-scoped access', { s
   let failBen = true;
   const worker = createNotificationWorker({
     repository, clientOrigin: 'https://example.com',
+    sendSubmissionEmail: async () => {},
     sendGuessEmail: async (message) => {
       if (message.email === 'ben@example.com' && failBen) throw new Error('test failure');
       messages.push(message);

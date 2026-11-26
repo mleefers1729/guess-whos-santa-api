@@ -6,7 +6,7 @@ import { readConfig } from './config.js';
 import { createRepository, migrate } from './db.js';
 import { createLocalStorage, createS3Storage } from './photos.js';
 import { createSendGridMailer } from './accounts.js';
-import { createGuessMailer, createNotificationWorker } from './notifications.js';
+import { createGuessMailer, createNotificationWorker, createSubmissionMailer } from './notifications.js';
 
 const config = readConfig();
 const { caFile, ...databaseConfig } = config.database ?? {};
@@ -33,9 +33,10 @@ if (pool) {
   await cleanup();
   cleanupTimer = setInterval(cleanup, 60 * 60 * 1000).unref();
   const notifications = createNotificationWorker({
-    repository, sendGuessEmail: createGuessMailer(config.email), clientOrigin: config.clientOrigin,
+    repository, sendGuessEmail: createGuessMailer(config.email),
+    sendSubmissionEmail: createSubmissionMailer(config.email), clientOrigin: config.clientOrigin,
   });
-  const runNotifications = () => notifications.run().catch((error) => console.error('Guessing notification worker failed', error));
+  const runNotifications = () => notifications.run().catch((error) => console.error('Notification worker failed', error));
   notificationTimer = setInterval(runNotifications, 5000).unref();
   runNotifications();
 } else {
