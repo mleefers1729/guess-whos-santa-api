@@ -421,6 +421,13 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     await sendState(req, res);
   });
 
+  router.post('/parties/:code/reopen-submissions', authenticate, hostOnly, async (req, res) => {
+    const result = await repository.reopenSubmissions(req.me.party_id);
+    if (result === 'started') throw httpError(409, 'Submissions cannot reopen after anyone has guessed or revealed the Santas');
+    if (result !== 'reopened') throw httpError(409, 'Submissions can only reopen during guessing');
+    await sendState(req, res);
+  });
+
   router.put('/parties/:code/guesses/:photoId', authenticate, actor, async (req, res) => {
     const guessedPlayerId = readId(req.body?.playerId, 'Pick someone else in this party');
     const result = await repository.addGuess({

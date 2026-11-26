@@ -103,6 +103,7 @@ before hashing and are never logged or returned by the API.
 | `DELETE /parties/:code/players/:id` | host, or the player's adder | Lobby only; deletes their photos and any players they added |
 | `PUT /parties/:code/notification-email` `{email}` | member | Changes that member's notification address; revokes previous notification links. If called using a notification link, returns `replacementToken` for the current browser |
 | `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos; queues notifications transactionally |
+| `POST /parties/:code/reopen-submissions` | host | Guessing → lobby only before anyone has guessed or revealed; cancels queued guessing notifications |
 | `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing your own photo or after your reveal |
 | `POST /parties/:code/reveal` | members | Reveals and locks guesses for this player; party enters reveal phase after all players reveal |
 
@@ -136,6 +137,9 @@ Starting guessing queues one email per direct member with an address. Managed
 players are covered by the member who added them. Existing guests without an
 address are shown a form and the host sees a warning; starting is not blocked.
 An address added during guessing queues that member's notification.
+Reopening submissions deletes queued guessing notifications, but emails
+already sent or in flight can still arrive and their private links remain
+valid. Starting guessing again queues fresh notifications for current players.
 Email addresses are private to the member and are not independently verified
 when entered by guests. SendGrid accepts the email for delivery; acceptance does
 not guarantee delivery. A database-backed worker retries failed sends with

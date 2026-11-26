@@ -320,6 +320,21 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       });
     },
 
+    async reopenSubmissions(partyId) {
+      return transaction(pool, async (client) => {
+        const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
+        if (rows[0]?.phase !== 'guessing') return 'wrong-phase';
+        const activity = await client.query(`
+          SELECT EXISTS (SELECT 1 FROM guesses g JOIN players pl ON pl.id = g.guesser_id WHERE pl.party_id = $1)
+            OR EXISTS (SELECT 1 FROM players WHERE party_id = $1 AND revealed_at IS NOT NULL) AS started`, [partyId]);
+        if (activity.rows[0].started) return 'started';
+        await client.query(`
+          DELETE FROM guess_notifications WHERE player_id IN (SELECT id FROM players WHERE party_id = $1)`, [partyId]);
+        await client.query("UPDATE parties SET phase = 'lobby', version = version + 1 WHERE id = $1", [partyId]);
+        return 'reopened';
+      });
+    },
+
     async saveNotificationEmail({ partyId, playerId, email, replacementHash }) {
       return transaction(pool, async (client) => {
         const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
@@ -383,6 +398,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
 
     async finishGuessNotification({ playerId, partyId, leaseId, sent }) {
       return transaction(pool, async (client) => {
+        await client.query('SELECT id FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
         const { rowCount } = await client.query(`
           UPDATE guess_notifications SET status = $3, lease_id = NULL, lease_until = NULL,
             next_attempt = now() + make_interval(secs => least(900, 15 * power(2, least(attempts, 6))::int))

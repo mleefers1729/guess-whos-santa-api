@@ -360,6 +360,123 @@ test('guessing notifications retry and provide private party-scoped access', { s
   assert.equal((await call('GET', `/api/parties/${code}`, { token: hostToken })).status, 401);
 });
 
+test('only the host can reopen submissions before activity and restart notifications safely', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const image = await photo('red');
+  for (const player of [host, ava]) {
+    assert.equal((await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) })).status, 201);
+  }
+  assert.equal((await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token })).status, 409);
+  const started = await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  assert.equal(started.status, 200);
+  assert.equal((await call('POST', `/api/parties/${code}/reopen-submissions`, { token: ava.token })).status, 403);
+
+  const oldToken = randomBytes(32).toString('base64url');
+  const leaseId = randomUUID();
+  await pool.query('INSERT INTO notification_links (token_hash, player_id) VALUES ($1, $2)',
+    [createHash('sha256').update(oldToken).digest(), ava.playerId]);
+  await pool.query("UPDATE guess_notifications SET status = 'sending', lease_id = $2 WHERE player_id = $1", [ava.playerId, leaseId]);
+  const reopened = await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token });
+  assert.equal(reopened.status, 200);
+  assert.equal(reopened.body.phase, 'lobby');
+  assert.equal(reopened.body.players.find((player) => player.id === ava.playerId).hasPhoto, true);
+  assert.notEqual(reopened.headers.get('etag'), started.headers.get('etag'));
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM guess_notifications WHERE player_id = $1', [ava.playerId])).rows[0].n, 0);
+  assert.equal((await call('GET', `/api/parties/${code}/notification-access`, { token: oldToken })).body.phase, 'lobby');
+  assert.equal((await call('PUT', `/api/parties/${code}/photo`, { token: ava.token, body: photoForm(image) })).status, 201);
+  const newPlayer = await call('POST', `/api/parties/${code}/players`, { json: { name: 'New', email: 'new@example.com' } });
+  assert.equal(newPlayer.status, 201);
+
+  const restarted = await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  assert.equal(restarted.body.phase, 'guessing');
+  const partyId = (await pool.query('SELECT id FROM parties WHERE code = $1', [code])).rows[0].id;
+  await createRepository(pool).finishGuessNotification({ playerId: ava.playerId, partyId, leaseId, sent: true });
+  const notification = (await pool.query('SELECT status, lease_id FROM guess_notifications WHERE player_id = $1', [ava.playerId])).rows[0];
+  assert.deepEqual(notification, { status: 'pending', lease_id: null }, 'an old in-flight send cannot mark a new notification as sent');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM guess_notifications WHERE player_id = $1', [newPlayer.body.playerId])).rows[0].n, 1);
+  const view = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  const target = view.santas.find((santa) => !santa.isMine);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${target.id}`, {
+    token: ava.token, json: { playerId: host.playerId },
+  })).status, 200);
+  const blocked = await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.body.error, /guessed or revealed/);
+});
+
+test('reopening is blocked after a managed player reveals without guessing', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const image = await photo('green');
+  for (const player of [host, ava]) await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) });
+  const child = (await call('POST', `/api/parties/${code}/added-players`, {
+    token: host.token, json: { name: 'Child' },
+  })).body.players.find((player) => player.name === 'Child');
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  const revealed = await call('POST', `/api/parties/${code}/reveal?as=${child.id}`, { token: host.token });
+  assert.equal(revealed.status, 200);
+  assert.equal(revealed.body.players.find((player) => player.id === child.id).guessCount, 0);
+  const blocked = await call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.body.error, /guessed or revealed/);
+});
+
+test('a concurrent guess and reopen cannot both succeed', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const image = await photo('blue');
+  for (const player of [host, ava]) await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) });
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  const view = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  const target = view.santas.find((santa) => !santa.isMine);
+  const [reopen, guess] = await Promise.all([
+    call('POST', `/api/parties/${code}/reopen-submissions`, { token: host.token }),
+    call('PUT', `/api/parties/${code}/guesses/${target.id}`, { token: ava.token, json: { playerId: host.playerId } }),
+  ]);
+  assert.deepEqual([reopen.status, guess.status].sort(), [200, 409]);
+  const state = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  assert.equal(state.phase, reopen.status === 200 ? 'lobby' : 'guessing');
+  assert.equal(state.players.find((player) => player.id === ava.playerId).guessCount, guess.status === 200 ? 1 : 0);
+});
+
+test('reopening and finishing an in-flight guessing email do not deadlock', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const image = await photo('red');
+  for (const player of [host, ava]) await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) });
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  const partyId = (await pool.query('SELECT id FROM parties WHERE code = $1', [code])).rows[0].id;
+  const leaseId = randomUUID();
+  await pool.query("UPDATE guess_notifications SET status = 'sending', lease_id = $2 WHERE player_id = $1", [ava.playerId, leaseId]);
+  const client = await pool.connect();
+  let finishing;
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT id FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
+    finishing = createRepository(pool).finishGuessNotification({ playerId: ava.playerId, partyId, leaseId, sent: true });
+    let waiting = false;
+    for (let attempt = 0; attempt < 100 && !waiting; attempt += 1) {
+      const result = await pool.query(`
+        SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%parties%') AS waiting`);
+      waiting = result.rows[0].waiting;
+      if (!waiting) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(waiting, 'the email completion must wait for the party lock');
+    await client.query("SET LOCAL lock_timeout = '2s'");
+    await client.query('DELETE FROM guess_notifications WHERE player_id = $1', [ava.playerId]);
+  } finally {
+    await client.query('ROLLBACK');
+    client.release();
+    if (finishing) await finishing;
+  }
+});
+
 test('monitor requires the admin session and counts visits and retained parties', { skip }, async (t) => {
   const { call, signIn } = await serve(t);
   assert.equal((await call('GET', '/api/monitor/stats')).status, 401);
