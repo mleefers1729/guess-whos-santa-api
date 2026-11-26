@@ -213,7 +213,7 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
           WHERE pl.party_id = $1 ORDER BY pl.created_at, pl.id`, [partyId]),
         pool.query('SELECT id, player_id, eyes_key, face_key FROM photos WHERE party_id = $1 ORDER BY id', [partyId]),
         pool.query(`
-          SELECT g.guesser_id, g.photo_id, g.guessed_player_id
+          SELECT g.guesser_id, g.photo_id, g.guessed_player_id, g.created_at
           FROM guesses g JOIN photos ph ON ph.id = g.photo_id
           WHERE ph.party_id = $1`, [partyId]),
       ]);

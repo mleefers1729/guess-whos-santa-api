@@ -138,6 +138,73 @@ test('each managed player gets a stable shuffled order and their own reveal', ()
   assert.ok(added.santas.every((santa) => santa.faceUrl && santa.playerId));
 });
 
+test('final badges compare complete guessing speeds and reward accurate guesses and tricky Santas', () => {
+  const players = ['A', 'B', 'C', 'D'].map((id) => ({
+    id, name: id, is_host: id === 'A', added_by: id === 'D' ? 'A' : null, revealed_at: new Date(),
+  }));
+  const photos = ['A', 'B', 'C'].map((id) => ({
+    id: `photo-${id}`, player_id: id, eyes_key: `eyes/${id}`, face_key: `faces/${id}`,
+  }));
+  const guess = (guesser, photo, choice, seconds) => ({
+    guesser_id: guesser, photo_id: `photo-${photo}`, guessed_player_id: choice,
+    created_at: new Date(seconds * 1000),
+  });
+  const guesses = [
+    guess('A', 'B', 'B', 0), guess('A', 'C', 'C', 10),
+    guess('B', 'A', 'C', 0), guess('B', 'C', 'C', 20),
+    guess('C', 'A', 'B', 0), guess('C', 'B', 'A', 10),
+    guess('D', 'A', 'C', 0), guess('D', 'B', 'B', 1),
+  ];
+  const args = { me: players[0], party: { code: 'ABCDEF', phase: 'reveal', version: 1 },
+    snapshot: { players, photos, guesses }, storage: { url: (key) => key }, now: 0 };
+  const state = buildState(args).state;
+  const badges = Object.fromEntries(state.leaderboard.map((row) => [row.playerId, row.badges]));
+  assert.deepEqual(badges.A, ['perfect-detective', 'fastest', 'master-of-disguise', 'sneakiest-santa']);
+  assert.deepEqual(badges.B, ['slowest']);
+  assert.deepEqual(badges.C, ['fastest']);
+  assert.deepEqual(badges.D, [], 'incomplete players do not qualify for speed or perfect badges');
+  assert.deepEqual(state.views.D.leaderboard, state.views.A.leaderboard);
+
+  guesses.push(guess('D', 'C', 'C', 10));
+  const completed = buildState(args).state.leaderboard;
+  assert.ok(completed.find((row) => row.playerId === 'D').badges.includes('fastest'),
+    'compare average intervals when a player has more Santas to guess');
+  guesses[guesses.length - 1].created_at = undefined;
+  assert.ok(!buildState(args).state.leaderboard.find((row) => row.playerId === 'D').badges.includes('fastest'),
+    'missing timing data does not qualify for speed badges');
+
+  args.party.phase = 'guessing';
+  const provisional = buildState(args).state;
+  assert.ok(provisional.leaderboard.every((row) => !Object.hasOwn(row, 'badges')));
+  assert.ok(provisional.views.D.leaderboard.every((row) => !Object.hasOwn(row, 'badges')));
+});
+
+test('badges handle tied or insufficient results without inventing awards', () => {
+  const players = ['A', 'B', 'C'].map((id) => ({
+    id, name: id, is_host: id === 'A', added_by: null, revealed_at: new Date(),
+  }));
+  const photos = players.map(({ id }) => ({
+    id: `photo-${id}`, player_id: id, eyes_key: `eyes/${id}`, face_key: `faces/${id}`,
+  }));
+  const guess = (guesser, photo, choice, seconds) => ({
+    guesser_id: guesser, photo_id: `photo-${photo}`, guessed_player_id: choice,
+    created_at: new Date(seconds * 1000),
+  });
+  const args = { me: players[0], party: { code: 'ABCDEF', phase: 'reveal', version: 1 },
+    snapshot: { players, photos, guesses: [guess('A', 'B', 'C', 0), guess('B', 'A', 'C', 0)] },
+    storage: { url: (key) => key }, now: 0 };
+  let badges = Object.fromEntries(buildState(args).state.leaderboard.map((row) => [row.playerId, row.badges]));
+  assert.deepEqual(badges, { A: ['sneakiest-santa'], B: ['sneakiest-santa'], C: [] });
+
+  args.snapshot.guesses = [
+    guess('A', 'B', 'B', 0), guess('A', 'C', 'C', 10),
+    guess('B', 'A', 'A', 0), guess('B', 'C', 'C', 10),
+  ];
+  badges = Object.fromEntries(buildState(args).state.leaderboard.map((row) => [row.playerId, row.badges]));
+  assert.deepEqual(badges, { A: ['perfect-detective'], B: ['perfect-detective'], C: [] },
+    'equal speeds and no incorrect guesses do not produce speed or disguise badges');
+});
+
 test('guessing notifications retry and provide private party-scoped access', { skip }, async (t) => {
   const { call, createHost, signIn } = await serve(t);
   const { code, host, ava, ben } = await party(call, createHost);
@@ -535,10 +602,14 @@ test('a full party: masked eyes before reveal, real faces only for members after
   await call('PUT', `/api/parties/${code}/guesses/${others[1].id}`, {
     token: ava.token, json: { playerId: ben.playerId },
   });
+  const { rows: [partyRow] } = await pool.query('SELECT id FROM parties WHERE code = $1', [code]);
+  const snapshot = await createRepository(pool).snapshot(partyRow.id);
+  assert.ok(snapshot.guesses.every((guess) => guess.created_at instanceof Date), 'snapshots include guess timestamps');
 
   const revealed = await call('POST', `/api/parties/${code}/reveal`, { token: host.token });
   assert.equal(revealed.body.phase, 'guessing');
   assert.equal(revealed.body.views[host.playerId].revealed, true);
+  assert.ok(revealed.body.leaderboard.every((row) => !Object.hasOwn(row, 'badges')));
   const outsider = (await createHost({ name: 'Stranger' })).body;
   assert.equal((await call('GET', `/api/parties/${code}`, { token: outsider.token })).status, 401);
 
@@ -555,7 +626,9 @@ test('a full party: masked eyes before reveal, real faces only for members after
     token: ben.token, json: { playerId: host.playerId },
   })).status, 409);
   assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: ben.token })).status, 409);
-  assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: ava.token })).body.phase, 'reveal');
+  const final = (await call('POST', `/api/parties/${code}/reveal`, { token: ava.token })).body;
+  assert.equal(final.phase, 'reveal');
+  assert.ok(final.leaderboard.every((row) => Array.isArray(row.badges)));
   const avaSanta = reveal.santas.find((santa) => santa.playerId === ava.playerId);
   const face = await fetch(base + avaSanta.faceUrl);
   assert.equal(face.status, 200);

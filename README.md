@@ -111,6 +111,14 @@ Game state includes a stable, separately shuffled `views` entry for the member
 and each player they manage. Each view exposes faces and scores only after that
 player reveals. Scores are provisional until everyone has revealed. Existing
 parties already in the reveal phase remain revealed after migration.
+Final leaderboard rows include `badges` IDs. Fastest and slowest compare the
+average time between first and last guess for players who made at least two
+guesses and guessed every eligible Santa; they require at least two qualifying
+players with different times. Sneakiest Santa goes to the photo with the most
+incorrect guesses (at least one). Perfect Detective requires at least two
+guesses, all correct and complete. Master of Disguise requires at least two
+guesses at a photo, none correct. Ties share badges. No badges are exposed
+until the party is in the reveal phase.
 
 ### Guessing notifications
 

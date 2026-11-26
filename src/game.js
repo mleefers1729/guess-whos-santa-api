@@ -82,6 +82,47 @@ function santaOrder(photos, playerId) {
   return [...photos].sort((a, b) => key(a).localeCompare(key(b)));
 }
 
+function awardBadges(snapshot, photoOwner, scores) {
+  const badges = new Map(snapshot.players.map((player) => [player.id, []]));
+  const speeds = [];
+  for (const player of snapshot.players) {
+    const guesses = snapshot.guesses.filter((guess) => guess.guesser_id === player.id);
+    const possible = snapshot.photos.filter((photo) => photo.player_id !== player.id).length;
+    if (guesses.length >= 2 && guesses.length === possible) {
+      if (scores.get(player.id) === possible) badges.get(player.id).push('perfect-detective');
+      const times = guesses.map((guess) => new Date(guess.created_at).getTime());
+      if (times.every(Number.isFinite)) {
+        const earliest = times.reduce((min, time) => Math.min(min, time), Infinity);
+        const latest = times.reduce((max, time) => Math.max(max, time), -Infinity);
+        speeds.push({ id: player.id, interval: (latest - earliest) / (times.length - 1) });
+      }
+    }
+  }
+  if (speeds.length >= 2) {
+    const fastest = speeds.reduce((min, speed) => Math.min(min, speed.interval), Infinity);
+    const slowest = speeds.reduce((max, speed) => Math.max(max, speed.interval), -Infinity);
+    if (fastest !== slowest) {
+      for (const speed of speeds) {
+        if (speed.interval === fastest) badges.get(speed.id).push('fastest');
+        if (speed.interval === slowest) badges.get(speed.id).push('slowest');
+      }
+    }
+  }
+  const wrongCounts = snapshot.photos.map((photo) => {
+    const guesses = snapshot.guesses.filter((guess) => guess.photo_id === photo.id);
+    const wrong = guesses.filter((guess) => photoOwner.get(guess.photo_id) !== guess.guessed_player_id).length;
+    if (wrong >= 2 && wrong === guesses.length) badges.get(photo.player_id).push('master-of-disguise');
+    return { playerId: photo.player_id, wrong };
+  });
+  const mostWrong = wrongCounts.reduce((max, entry) => Math.max(max, entry.wrong), 0);
+  if (mostWrong > 0) {
+    for (const entry of wrongCounts) {
+      if (entry.wrong === mostWrong) badges.get(entry.playerId).push('sneakiest-santa');
+    }
+  }
+  return badges;
+}
+
 export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
   const expiresAt = new Date(Math.floor(now / URL_BUCKET_MS) * URL_BUCKET_MS + URL_TTL_MS);
   const rolls = Math.floor(now / URL_BUCKET_MS);
@@ -129,8 +170,10 @@ export function buildState({ me, party, snapshot, storage, now = Date.now() }) {
         scores.set(guess.guesser_id, scores.get(guess.guesser_id) + 1);
       }
     }
+    const badges = party.phase === 'reveal' ? awardBadges(snapshot, photoOwner, scores) : null;
     const leaderboard = players
-      .map((player) => ({ playerId: player.id, name: player.name, score: scores.get(player.id) }))
+      .map((player) => ({ playerId: player.id, name: player.name, score: scores.get(player.id),
+        ...(badges && { badges: badges.get(player.id) }) }))
       .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
     state.views = Object.fromEntries(snapshot.players.filter((player) => crew.has(player.id)).map((player) => {
       const revealed = Boolean(player.revealed_at);
