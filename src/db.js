@@ -482,6 +482,20 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       });
     },
 
+    async endGuessing(partyId) {
+      return transaction(pool, async (client) => {
+        const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR UPDATE', [partyId]);
+        if (rows[0]?.phase !== 'guessing') return 'closed';
+        await client.query(`
+          UPDATE players SET revealed_at = now()
+          WHERE party_id = $1 AND revealed_at IS NULL`, [partyId]);
+        await client.query(`
+          UPDATE parties SET phase = 'reveal', version = version + 1
+          WHERE id = $1`, [partyId]);
+        return 'ended';
+      });
+    },
+
     async revealPlayer({ partyId, playerId }) {
       return transaction(pool, async (client) => {
         const { rows } = await client.query('SELECT phase FROM parties WHERE id = $1 FOR UPDATE', [partyId]);

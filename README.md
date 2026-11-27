@@ -105,13 +105,20 @@ before hashing and are never logged or returned by the API.
 | `PUT /parties/:code/notification-email` `{email}` | member | Changes that member's notification address; revokes previous notification links. If called using a notification link, returns `replacementToken` for the current browser |
 | `POST /parties/:code/start` | host | Lobby → guessing; needs ≥ 2 photos; queues notifications transactionally |
 | `POST /parties/:code/reopen-submissions` | host | Guessing or reveal → lobby; resets all guesses and reveals and cancels queued guessing notifications |
+| `POST /parties/:code/end-guessing` | host | Guessing → final reveal immediately; locks every player, preserves saved guesses, and treats unanswered Santas as no score |
 | `PUT /parties/:code/guesses/:photoId` `{playerId}` | members | One guess per Santa (locked); no guessing your own photo or after your reveal |
 | `POST /parties/:code/reveal` | members | Reveals and locks guesses for this player; party enters reveal phase after all players reveal |
 
 Photo, media-consent, guess and reveal routes accept `?as=<playerId>` to act for a player you added.
 Game state includes a stable, separately shuffled `views` entry for the member
 and each player they manage. Each view exposes faces and scores only after that
-player reveals. Scores are provisional until everyone has revealed. Existing
+player reveals. The adder can skip a local player's remaining guesses using
+`POST /parties/:code/reveal?as=<playerId>` without saving additional guesses.
+Saved guesses still count; skipping locks that player and counts them as finished,
+even if they have no photo or guesses. The UI asks for confirmation before
+skipping or ending guessing. Ending guessing ignores unsaved browser selections;
+reveal selected picks first to save them. Scores are provisional until everyone
+has revealed or the host ends guessing. Existing
 parties already in the reveal phase remain revealed after migration.
 Final leaderboard rows include `badges` IDs. Fastest and slowest compare the
 average time between first and last guess for players who made at least two

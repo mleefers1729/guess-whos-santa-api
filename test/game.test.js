@@ -487,6 +487,111 @@ test('reopening a fully revealed party resets guesses and managed-player reveals
   assert.equal((await call('GET', `/api/parties/${code}`, { token: ava.token })).body.santas.find((santa) => santa.id === target.id).myGuess, null);
 });
 
+test('only the host can end guessing early and finalize saved scores for everyone', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const child = (await call('POST', `/api/parties/${code}/added-players`, {
+    token: ava.token, json: { name: 'Not playing' },
+  })).body.players.find((player) => player.name === 'Not playing');
+  const image = await photo('green');
+  for (const player of [host, ava]) {
+    await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) });
+  }
+  const endPath = `/api/parties/${code}/end-guessing`;
+  assert.equal((await call('POST', endPath, { token: host.token })).status, 409);
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  assert.equal((await call('POST', endPath)).status, 401);
+  assert.equal((await call('POST', endPath, { token: ava.token })).status, 403);
+  const view = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  const target = view.santas.find((santa) => !santa.isMine);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${target.id}`, {
+    token: ava.token, json: { playerId: host.playerId },
+  })).status, 200);
+  await call('POST', `/api/parties/${code}/reveal`, { token: host.token });
+  const before = (await call('GET', `/api/parties/${code}`, { token: host.token })).body;
+  const ended = await call('POST', endPath, { token: host.token });
+  assert.equal(ended.status, 200, 'host can end even after their own reveal');
+  assert.equal(ended.body.phase, 'reveal');
+  assert.equal(ended.body.version, before.version + 1);
+  assert.ok(ended.body.players.every((player) => player.revealed));
+  assert.equal(ended.body.leaderboard.find((row) => row.playerId === ava.playerId).score, 1);
+  assert.equal(ended.body.leaderboard.find((row) => row.playerId === child.id).score, 0);
+  assert.ok(ended.body.leaderboard.every((row) => Array.isArray(row.badges)));
+  const avaFinal = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  assert.equal(avaFinal.views[child.id].revealed, true);
+  assert.ok(avaFinal.views[child.id].santas.every((santa) => santa.faceUrl));
+  assert.deepEqual(avaFinal.views[child.id].leaderboard, ended.body.leaderboard);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${target.id}`, {
+    token: ben.token, json: { playerId: host.playerId },
+  })).status, 409);
+  assert.equal((await call('POST', endPath, { token: host.token })).status, 409);
+});
+
+test('a concurrent guess and host finalization produce a locked, consistent score', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const image = await photo('blue');
+  for (const player of [host, ava]) {
+    await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) });
+  }
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  const view = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  const target = view.santas.find((santa) => !santa.isMine);
+  const [ended, guessed] = await Promise.all([
+    call('POST', `/api/parties/${code}/end-guessing`, { token: host.token }),
+    call('PUT', `/api/parties/${code}/guesses/${target.id}`, { token: ava.token, json: { playerId: host.playerId } }),
+  ]);
+  assert.equal(ended.status, 200);
+  assert.ok([200, 409].includes(guessed.status));
+  const final = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  assert.equal(final.phase, 'reveal');
+  assert.ok(final.players.every((player) => player.revealed));
+  assert.equal(final.leaderboard.find((row) => row.playerId === ava.playerId).score, guessed.status === 200 ? 1 : 0);
+  assert.deepEqual(ended.body.leaderboard, final.leaderboard);
+});
+
+test('skipping local players preserves saved guesses and lets the party finish', { skip }, async (t) => {
+  const { call, createHost } = await serve(t);
+  const { code, host, ava, ben } = await party(call, createHost);
+  t.after(() => pool.query('DELETE FROM parties WHERE code = $1', [code]));
+  const children = [];
+  for (const name of ['Partial player', 'Not playing']) {
+    const added = await call('POST', `/api/parties/${code}/added-players`, { token: ava.token, json: { name } });
+    children.push(added.body.players.find((player) => player.name === name));
+  }
+  const [partial, absent] = children;
+  const image = await photo('red');
+  for (const player of [host, ava]) {
+    await call('PUT', `/api/parties/${code}/photo`, { token: player.token, body: photoForm(image) });
+  }
+  await call('POST', `/api/parties/${code}/start`, { token: host.token });
+  const view = (await call('GET', `/api/parties/${code}`, { token: ava.token })).body;
+  const target = view.santas.find((santa) => !santa.isMine);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${target.id}?as=${partial.id}`, {
+    token: ava.token, json: { playerId: host.playerId },
+  })).status, 200);
+  assert.equal((await call('POST', `/api/parties/${code}/reveal?as=${partial.id}`, { token: ben.token })).status, 404);
+  const skipped = await call('POST', `/api/parties/${code}/reveal?as=${partial.id}`, { token: ava.token });
+  assert.equal(skipped.status, 200);
+  assert.equal(skipped.body.views[partial.id].revealed, true);
+  assert.equal(skipped.body.views[ava.playerId].revealed, false);
+  assert.equal(skipped.body.views[partial.id].leaderboard.find((row) => row.playerId === partial.id).score, 1);
+  const other = view.santas.find((santa) => santa.id !== target.id);
+  assert.equal((await call('PUT', `/api/parties/${code}/guesses/${other.id}?as=${partial.id}`, {
+    token: ava.token, json: { playerId: ava.playerId },
+  })).status, 409);
+  for (const player of [host, ava, ben]) {
+    assert.equal((await call('POST', `/api/parties/${code}/reveal`, { token: player.token })).status, 200);
+  }
+  const final = await call('POST', `/api/parties/${code}/reveal?as=${absent.id}`, { token: ava.token });
+  assert.equal(final.status, 200);
+  assert.equal(final.body.phase, 'reveal', 'last skipped player no longer holds up the party');
+  assert.ok(final.body.players.every((player) => player.revealed));
+  assert.equal(final.body.views[absent.id].leaderboard.find((row) => row.playerId === absent.id).score, 0);
+});
+
 test('a concurrent guess cannot survive reopening submissions', { skip }, async (t) => {
   const { call, createHost } = await serve(t);
   const { code, host, ava } = await party(call, createHost);

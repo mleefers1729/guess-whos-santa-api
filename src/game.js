@@ -460,6 +460,12 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     await sendState(req, res);
   });
 
+  router.post('/parties/:code/end-guessing', authenticate, hostOnly, async (req, res) => {
+    const result = await repository.endGuessing(req.me.party_id);
+    if (result !== 'ended') throw httpError(409, 'Guessing is not open');
+    await sendState(req, res);
+  });
+
   router.post('/parties/:code/reveal', authenticate, actor, async (req, res) => {
     const result = await repository.revealPlayer({ partyId: req.me.party_id, playerId: req.actor.id });
     if (result !== 'revealed') throw httpError(409, 'Reveal is only available once per player during guessing');
