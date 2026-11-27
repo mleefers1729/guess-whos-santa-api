@@ -100,6 +100,14 @@ CREATE TABLE IF NOT EXISTS monitor_totals (
   page_loads bigint NOT NULL DEFAULT 0
 );
 INSERT INTO monitor_totals (id) VALUES (true) ON CONFLICT DO NOTHING;
+ALTER TABLE monitor_totals ADD COLUMN IF NOT EXISTS ad_started_at timestamptz NOT NULL DEFAULT now();
+CREATE TABLE IF NOT EXISTS monitor_ad_daily (
+  day date NOT NULL,
+  placement text NOT NULL CHECK (placement IN ('home', 'lobby', 'guessing', 'results')),
+  impressions bigint NOT NULL DEFAULT 0 CHECK (impressions >= 0),
+  clicks bigint NOT NULL DEFAULT 0 CHECK (clicks >= 0),
+  PRIMARY KEY (day, placement)
+);
 CREATE TABLE IF NOT EXISTS monitor_visitors (
   token_hash bytea PRIMARY KEY,
   first_seen timestamptz NOT NULL DEFAULT now(),
@@ -154,9 +162,37 @@ export function createRepository(pool, { retentionDays = 30 } = {}) {
       });
     },
 
+    async recordAdEvent({ placement, event }) {
+      await pool.query(`
+        INSERT INTO monitor_ad_daily (day, placement, impressions, clicks)
+        VALUES ((now() AT TIME ZONE 'UTC')::date, $1, $2, $3)
+        ON CONFLICT (day, placement) DO UPDATE SET
+          impressions = monitor_ad_daily.impressions + EXCLUDED.impressions,
+          clicks = monitor_ad_daily.clicks + EXCLUDED.clicks`,
+      [placement, event === 'impression' ? 1 : 0, event === 'click' ? 1 : 0]);
+    },
+
     async monitorStats() {
       const { rows } = await pool.query(`
-        SELECT m.started_at, m.parties_created, m.page_loads,
+        SELECT m.started_at, m.parties_created, m.page_loads, m.ad_started_at,
+          (SELECT coalesce(sum(impressions), 0) FROM monitor_ad_daily) AS ad_impressions,
+          (SELECT coalesce(sum(clicks), 0) FROM monitor_ad_daily) AS ad_clicks,
+          (SELECT json_agg(json_build_object(
+              'day', to_char(days.day, 'YYYY-MM-DD'),
+              'impressions', coalesce(totals.impressions, 0),
+              'clicks', coalesce(totals.clicks, 0)
+            ) ORDER BY days.day)
+            FROM (
+              SELECT (now() AT TIME ZONE 'UTC')::date - 29 + n AS day
+              FROM generate_series(0, 29) AS n
+            ) days
+            LEFT JOIN (
+              SELECT day, sum(impressions) AS impressions, sum(clicks) AS clicks
+              FROM monitor_ad_daily
+              WHERE day BETWEEN (now() AT TIME ZONE 'UTC')::date - 29 AND (now() AT TIME ZONE 'UTC')::date
+              GROUP BY day
+            ) totals USING (day)
+          ) AS ad_daily,
           (SELECT count(*) FROM monitor_visitors) AS browsers,
           (SELECT count(*) FROM monitor_visitors WHERE last_seen >= now() - interval '7 days') AS browsers_7d,
           (SELECT count(*) FROM parties WHERE created_at > now() - make_interval(days => $1)) AS active_parties,

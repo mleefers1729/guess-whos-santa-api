@@ -46,6 +46,27 @@ counts include only retained parties (including players added by others); they
 decrease as players are removed or parties expire. A database trigger counts
 successful new parties even after their records are deleted.
 
+`POST /api/monitor/ad-events` accepts `{placement, event, destination?}` without
+sign-in, but requires `X-Santa-Request: 1`, rejects cross-site requests, and is
+limited to 120 events/minute/IP. Placements are `home`, `lobby`, `guessing`, and
+`results`. Events are `impression` or `click`; clicks require `ios`, `android`,
+or `website` as the destination. Impressions must omit the destination.
+The browser counts an impression after at least 50% of the ad is visible in
+a visible tab for one continuous second, once per placement per page load,
+including across client-side navigation. Clicks include the brand, website,
+and both store badges, including middle-clicks. Tracking does not block navigation;
+failed requests are logged. These are client-reported estimates, not verified
+human audiences or billing measurements.
+
+Ad counts are atomically aggregated by UTC date and placement in
+`monitor_ad_daily`, retained indefinitely without new visitor identifiers.
+Admin-only stats include `ad_started_at`, all-time `ad_impressions` and
+`ad_clicks`, and `ad_daily`: exactly 30 ascending `{day: "YYYY-MM-DD",
+impressions, clicks}` rows through today in UTC, including zero-activity days.
+Totals include older days outside the chart. Ad tracking begins on migration;
+earlier impressions and clicks cannot be recovered. The chart includes a daily
+counts table for exact values and accessibility.
+
 All routes are under `/api`, return `Cache-Control: no-store`, and use JSON
 errors `{ "error": "message" }`. Players authenticate with
 `Authorization: Bearer <token>`; the token is returned once on create/join and

@@ -12,6 +12,10 @@ export function createMonitorRouter({ repository, secureCookies, rateLimitEnable
     windowMs: 60 * 1000, limit: 60, standardHeaders: 'draft-8', legacyHeaders: false,
     message: { error: 'Too many visits; try again later' },
   }) : (_req, _res, next) => next();
+  const adLimit = rateLimitEnabled ? rateLimit({
+    windowMs: 60 * 1000, limit: 120, standardHeaders: 'draft-8', legacyHeaders: false,
+    message: { error: 'Too many ad events; try again later' },
+  }) : (_req, _res, next) => next();
 
   router.post('/monitor/visit', visitLimit, async (req, res) => {
     if (req.get('x-santa-request') !== '1' || req.get('sec-fetch-site') === 'cross-site') {
@@ -22,6 +26,20 @@ export function createMonitorRouter({ repository, secureCookies, rateLimitEnable
     const token = /^[\w-]{43}$/.test(value ?? '') ? value : randomBytes(32).toString('base64url');
     await repository.recordVisit(createHash('sha256').update(token).digest());
     res.cookie(cookieName, token, cookieOptions);
+    res.status(204).end();
+  });
+
+  router.post('/monitor/ad-events', adLimit, async (req, res) => {
+    if (req.get('x-santa-request') !== '1' || req.get('sec-fetch-site') === 'cross-site') {
+      return res.status(403).json({ error: 'Open this site to continue' });
+    }
+    const { placement, event, destination } = req.body ?? {};
+    if (!['home', 'lobby', 'guessing', 'results'].includes(placement)
+      || !['impression', 'click'].includes(event)
+      || (event === 'click' ? !['ios', 'android', 'website'].includes(destination) : destination !== undefined)) {
+      return res.status(400).json({ error: 'Invalid ad event' });
+    }
+    await repository.recordAdEvent({ placement, event });
     res.status(204).end();
   });
 

@@ -646,6 +646,74 @@ test('reopening and finishing an in-flight guessing email do not deadlock', { sk
   }
 });
 
+test('ad events persist totals and expose exactly 30 zero-filled UTC days only to the admin', { skip }, async (t) => {
+  const { call, signIn } = await serve(t);
+  t.after(() => pool.query('DELETE FROM monitor_ad_daily'));
+  t.after(() => pool.query('DELETE FROM login_codes WHERE email = $1', ['mitchell.leefers@gmail.com']));
+  const adminUser = await signIn('mitchell.leefers@gmail.com');
+  const before = (await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie })).body;
+  assert.ok(before.ad_started_at);
+  assert.equal(before.ad_daily.length, 30);
+  assert.ok(before.ad_daily.every((day) => day.impressions === 0 && day.clicks === 0));
+  for (const placement of ['home', 'lobby', 'guessing', 'results']) {
+    assert.equal((await call('POST', '/api/monitor/ad-events', { json: { placement, event: 'impression' } })).status, 204);
+  }
+  await Promise.all(['ios', 'android', 'website', 'website'].map(async (destination) => {
+    assert.equal((await call('POST', '/api/monitor/ad-events', {
+      json: { placement: 'home', event: 'click', destination },
+    })).status, 204);
+  }));
+  const dates = (await pool.query(`
+    INSERT INTO monitor_ad_daily (day, placement, impressions, clicks)
+    VALUES ((now() AT TIME ZONE 'UTC')::date - 2, 'results', 7, 2),
+      ((now() AT TIME ZONE 'UTC')::date - 29, 'results', 5, 1),
+      ((now() AT TIME ZONE 'UTC')::date - 30, 'results', 8, 3)
+    RETURNING to_char(day, 'YYYY-MM-DD') AS day`)).rows.map((row) => row.day);
+  const stats = await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie });
+  assert.equal(stats.headers.get('cache-control'), 'no-store');
+  assert.equal(Number(stats.body.ad_impressions), 24);
+  assert.equal(Number(stats.body.ad_clicks), 10);
+  assert.equal(stats.body.ad_daily.length, 30);
+  assert.deepEqual(stats.body.ad_daily[0], { day: dates[1], impressions: 5, clicks: 1 });
+  const today = (await pool.query("SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day")).rows[0].day;
+  assert.deepEqual(stats.body.ad_daily[29], { day: today, impressions: 4, clicks: 4 });
+  assert.deepEqual(stats.body.ad_daily[27], { day: dates[0], impressions: 7, clicks: 2 });
+  assert.ok(stats.body.ad_daily.filter((_, index) => ![0, 27, 29].includes(index))
+    .every((day) => day.impressions === 0 && day.clicks === 0));
+  assert.ok(!stats.body.ad_daily.some((day) => day.day === dates[2]), '30 days ago is outside the chart');
+  await migrate(pool);
+  const persisted = (await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie })).body;
+  assert.deepEqual(persisted.ad_daily, stats.body.ad_daily);
+  assert.equal(persisted.ad_started_at, before.ad_started_at, 'migration does not reset tracking start');
+  assert.equal((await call('GET', '/api/monitor/stats')).status, 401);
+  const other = await signIn();
+  assert.equal((await call('GET', '/api/monitor/stats', { cookie: other.cookie })).status, 403);
+});
+
+test('ad tracking rejects invalid or cross-site events without incrementing counts', { skip }, async (t) => {
+  const { call, signIn } = await serve(t);
+  t.after(() => pool.query('DELETE FROM login_codes WHERE email = $1', ['mitchell.leefers@gmail.com']));
+  const adminUser = await signIn('mitchell.leefers@gmail.com');
+  const before = (await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie })).body;
+  for (const json of [
+    {}, { placement: 'elsewhere', event: 'impression' }, { placement: 'home', event: 'view' },
+    { placement: 'home', event: 'click' }, { placement: 'home', event: 'click', destination: 'arbitrary-url' },
+    { placement: 'home', event: 'impression', destination: 'ios' },
+  ]) {
+    assert.equal((await call('POST', '/api/monitor/ad-events', { json })).status, 400);
+  }
+  const json = { placement: 'home', event: 'impression' };
+  assert.equal((await call('POST', '/api/monitor/ad-events', {
+    json, headers: { 'X-Santa-Request': '0' },
+  })).status, 403);
+  assert.equal((await call('POST', '/api/monitor/ad-events', {
+    json, headers: { 'Sec-Fetch-Site': 'cross-site' },
+  })).status, 403);
+  const after = (await call('GET', '/api/monitor/stats', { cookie: adminUser.cookie })).body;
+  assert.equal(after.ad_impressions, before.ad_impressions);
+  assert.equal(after.ad_clicks, before.ad_clicks);
+});
+
 test('monitor requires the admin session and counts visits and retained parties', { skip }, async (t) => {
   const { call, signIn } = await serve(t);
   assert.equal((await call('GET', '/api/monitor/stats')).status, 401);
