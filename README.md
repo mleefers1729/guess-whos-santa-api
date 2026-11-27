@@ -83,6 +83,14 @@ authentication bypass. Tests inject a fake mailer and do not send real email.
 Sign-in emails include a Santa-themed HTML layout using the site's public Santa
 icon, plus a plain-text alternative. The code and safety instructions remain
 readable even when an email client blocks images.
+Verification codes appear once per email part as six contiguous, selectable
+digits, near the top of the branded email. Clients that support `user-select`
+can select the whole code; touch-and-hold/select instructions work as the
+fallback. Email scripts and fake clipboard buttons are not used. The website
+retains `autocomplete="one-time-code"` and accepts pasted codes with whitespace
+or hyphens while preserving leading zeros. Automatic email-code suggestions
+depend on the user's Mail/browser setup and cannot be guaranteed by the template;
+verify them on a real iPhone with the updated email.
 
 | Route | Notes |
 | --- | --- |

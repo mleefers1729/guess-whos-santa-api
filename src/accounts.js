@@ -28,35 +28,35 @@ export function createSendGridMailer({ apiKey, sender }) {
       body: JSON.stringify({
         personalizations: [{ to: [{ email }] }],
         from: { email: sender, name: "Santa's Helpers | Guess Who's Santa" },
-        subject: "Santa's helpers have your sign-in code",
+        subject: "Your Guess Who's Santa verification code",
         content: [{
           type: 'text/plain',
-          value: `Ho ho hello!\n\nSanta's helpers have a little something for you: your Guess Who's Santa sign-in code.\n\n${code}\n\nEnter this code in the browser where you requested it to get back to the merry-making. It expires in 10 minutes and works only in that browser.\n\nKeep this code under your hat. Never share it, even with someone claiming to be Santa's helpers. If you did not request it, you can safely ignore this email.\n\nStay merry,\nSanta's Helpers\nGuess Who's Santa?\nhttps://guesswhossanta.com`,
+          value: `Your Guess Who's Santa verification code is:\n\n${code}\n\nSelect these six digits to copy them, then paste them into the sign-in form.\n\nHo ho hello! Santa's helpers are ready to get you back to the merry-making. Enter this code in the browser where you requested it. It expires in 10 minutes and works only in that browser.\n\nKeep this code under your hat. Never share it, even with someone claiming to be Santa's helpers. If you did not request it, you can safely ignore this email.\n\nStay merry,\nSanta's Helpers\nGuess Who's Santa?\nhttps://guesswhossanta.com`,
         }, {
           type: 'text/html',
           value: `<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Your Guess Who's Santa sign-in code</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Your Guess Who's Santa verification code</title></head>
 <body style="margin:0;padding:0;background-color:#faf7ed;color:#203d32;font-family:Arial,Helvetica,sans-serif;">
-  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">A little North Pole magic for your next merry moment. Your sign-in code is inside.</div>
+  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">Your six-digit verification code for Guess Who's Santa. Expires in 10 minutes.</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#faf7ed;">
     <tr><td align="center" style="padding:32px 16px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background-color:#fffdf6;border:1px solid #dedfd1;border-radius:20px;">
         <tr><td align="center" style="padding:28px 24px 12px;">
-          <img src="https://guesswhossanta.com/icon-512.png" width="144" height="144" alt="A smiling Santa in his red hat" style="display:block;width:144px;height:144px;border:0;border-radius:24px;">
+          <img src="https://guesswhossanta.com/icon-512.png" width="80" height="80" alt="A smiling Santa in his red hat" style="display:block;width:80px;height:80px;border:0;border-radius:16px;">
           <p style="margin:16px 0 0;color:#214e3c;font-size:18px;font-weight:bold;">Guess Who's Santa?</p>
         </td></tr>
         <tr><td align="center" style="padding:12px 24px 28px;">
           <p style="margin:0 0 12px;color:#b52d3a;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">Special delivery from the North Pole</p>
-          <h1 style="margin:0 0 16px;color:#214e3c;font-size:30px;line-height:1.2;">Ho ho hello!</h1>
-          <p style="margin:0 0 24px;font-size:16px;line-height:1.6;">Santa's helpers have a little something for you:<br>your sign-in code.</p>
+          <h1 style="margin:0 0 16px;color:#214e3c;font-size:30px;line-height:1.2;">Your verification code</h1>
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
             <tr><td align="center" style="padding:20px 8px;background-color:#e9eddf;border:1px solid #dedfd1;border-radius:12px;">
-              <p style="margin:0 0 8px;color:#214e3c;font-size:12px;font-weight:bold;text-transform:uppercase;">Your sign-in code</p>
-              <p style="margin:0;color:#214e3c;font-family:'Courier New',monospace;font-size:36px;font-weight:bold;letter-spacing:6px;line-height:1.3;">${code}</p>
+              <p style="margin:0 0 8px;color:#214e3c;font-size:14px;">Your verification code is:</p>
+              <p style="margin:0;color:#214e3c;font-family:'Courier New',monospace;font-size:40px;font-weight:bold;letter-spacing:normal;line-height:1.3;cursor:text;-webkit-user-select:all;user-select:all;">${code}</p>
             </td></tr>
           </table>
-          <p style="margin:24px 0 0;font-size:16px;line-height:1.6;">Enter this code in the browser where you requested it to get back to the merry-making.</p>
+          <p style="margin:12px 0 0;color:#5a665a;font-size:14px;line-height:1.6;">Touch and hold the code, or select the six digits, to copy. Then paste it into the sign-in form.</p>
+          <p style="margin:24px 0 0;font-size:16px;line-height:1.6;">Ho ho hello! Santa's helpers are ready to get you back to the merry-making. Enter this code in the browser where you requested it.</p>
           <p style="margin:12px 0 0;color:#5a665a;font-size:14px;line-height:1.6;">It expires in <strong>10 minutes</strong> and works only in that browser.</p>
           <p style="margin:24px 0 0;font-size:16px;line-height:1.6;">Stay merry,<br><strong>Santa's Helpers</strong></p>
         </td></tr>

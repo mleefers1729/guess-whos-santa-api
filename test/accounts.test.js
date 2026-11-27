@@ -16,7 +16,7 @@ test('SendGrid sends the browser-bound code using the authenticated sender', asy
   const body = JSON.parse(options.body);
   assert.deepEqual(body.personalizations, [{ to: [{ email: 'recipient@example.com' }] }]);
   assert.deepEqual(body.from, { email: 'signin@guesswhossanta.com', name: "Santa's Helpers | Guess Who's Santa" });
-  assert.match(body.subject, /Santa's helpers.*sign-in code/);
+  assert.equal(body.subject, "Your Guess Who's Santa verification code");
   assert.doesNotMatch(body.subject, /001234/);
   assert.deepEqual(body.content.map((part) => part.type), ['text/plain', 'text/html']);
   for (const { value } of body.content) {
@@ -28,6 +28,12 @@ test('SendGrid sends the browser-bound code using the authenticated sender', asy
     assert.match(value, /If you did not request it/);
   }
   const html = body.content[1].value;
+  const plain = body.content[0].value;
+  assert.match(plain, /^Your Guess Who's Santa verification code is:\n\n001234\n\n/);
+  assert.equal((plain.match(/001234/g) ?? []).length, 1);
+  assert.equal((html.match(/001234/g) ?? []).length, 1);
+  assert.ok(html.indexOf('001234') < html.indexOf('Ho ho hello!'), 'the code comes before the greeting');
+  assert.match(html, /Touch and hold the code/);
   assert.match(html, /<img src="https:\/\/guesswhossanta\.com\/icon-512\.png"[^>]+alt="[^"]+"/);
   assert.match(html, /<p[^>]*>001234<\/p>/);
   assert.doesNotMatch(html, /<script|<form|<svg|data:image/i);
