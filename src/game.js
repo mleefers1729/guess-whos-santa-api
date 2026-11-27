@@ -23,6 +23,11 @@ export function readEmail(value) {
   return email;
 }
 
+function readOptionalEmail(value) {
+  if (value == null || (typeof value === 'string' && !value.trim())) return null;
+  return readEmail(value);
+}
+
 function newCode() {
   return Array.from({ length: CODE_LENGTH }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join('');
 }
@@ -275,7 +280,7 @@ export function createGameRouter({ repository, storage, maxUploadBytes, rateLimi
     if (existing) return res.json({ code: party.code, name: party.name, playerId: existing.id, account: true });
     const player = newPlayer(readName(req.body));
     player.accountId = req.account?.id;
-    player.notificationEmail = req.account ? null : readEmail(req.body?.email);
+    player.notificationEmail = req.account ? null : readOptionalEmail(req.body?.email);
     let result;
     try {
       result = await repository.addPlayer({ partyId: party.id, player });

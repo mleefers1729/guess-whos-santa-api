@@ -307,7 +307,10 @@ test('seen submission updates stay hidden across host sessions without cancellin
 test('guessing notifications retry and provide private party-scoped access', { skip }, async (t) => {
   const { call, createHost, signIn } = await serve(t);
   const { code, host, ava, ben } = await party(call, createHost);
-  assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'No email' } })).status, 400);
+  const noEmail = await call('POST', `/api/parties/${code}/players`, { json: { name: 'No email' } });
+  assert.equal(noEmail.status, 201);
+  const noEmailState = await call('GET', `/api/parties/${code}`, { token: noEmail.body.token });
+  assert.equal(noEmailState.body.players.find((player) => player.id === noEmail.body.playerId).canNotify, false);
   assert.equal((await call('POST', `/api/parties/${code}/players`, { json: { name: 'Bad email', email: 'invalid' } })).status, 400);
   await pool.query('UPDATE players SET notification_email = NULL WHERE id = $1', [ava.playerId]);
   const child = (await call('POST', `/api/parties/${code}/added-players`, {
